@@ -87,6 +87,12 @@ impl OfflineEnvelopeBuilder {
         let envelope = EnvelopeBuilder::new(origin_pubkey, tx_xdr)
             .ttl(ttl_hops)
             .build(signing_key);
+        let span = tracing::info_span!(
+            "envelope_created",
+            message_id = %hex::encode(envelope.message_id),
+            operation = "build_and_sign"
+        );
+        span.in_scope(|| tracing::info!("envelope signed"));
         Ok((envelope, xdr_sequence))
     }
 }
@@ -108,6 +114,13 @@ pub fn resequence_and_resign(
     let envelope = EnvelopeBuilder::new(origin_pubkey, new_tx_xdr)
         .ttl(old_envelope.ttl_hops)
         .build(signing_key);
+
+    let span = tracing::info_span!(
+        "envelope_created",
+        message_id = %hex::encode(envelope.message_id),
+        operation = "resequence_and_resign"
+    );
+    span.in_scope(|| tracing::info!("envelope re-signed"));
 
     Ok(envelope)
 }
@@ -290,6 +303,12 @@ pub fn try_promote(
     let envelope = EnvelopeBuilder::new(origin_pubkey, partial.tx_xdr.clone())
         .ttl(ttl_hops)
         .build(mesh_signing_key);
+    let span = tracing::info_span!(
+        "envelope_created",
+        message_id = %hex::encode(envelope.message_id),
+        operation = "multisig_promote"
+    );
+    span.in_scope(|| tracing::info!("envelope signed after multisig promotion"));
     Ok(envelope)
 }
 

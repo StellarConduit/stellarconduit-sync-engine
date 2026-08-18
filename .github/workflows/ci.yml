@@ -91,8 +91,19 @@ jobs:
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: bench
 
-      - name: Compare benchmark results against base (PR only)
+      - name: Check benchmark history branch
+        id: benchmark-history
         if: github.event_name == 'pull_request'
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "Benchmark comparison skipped: origin/gh-pages does not exist yet."
+          fi
+
+      - name: Compare benchmark results against base (PR only)
+        if: github.event_name == 'pull_request' && steps.benchmark-history.outputs.available == 'true'
         uses: benchmark-action/github-action-benchmark@v1
         with:
           name: Sync Engine Benchmarks

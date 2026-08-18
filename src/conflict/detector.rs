@@ -49,6 +49,12 @@ pub struct Conflict {
 /// but are different envelopes. Returns `None` if they're the same envelope
 /// (e.g. seen twice via different gossip paths) or occupy different slots.
 pub fn conflicts_between(a: &QueuedSlot, b: &QueuedSlot) -> Option<Conflict> {
+    let span = tracing::info_span!(
+        "conflict_detection",
+        message_id = %hex::encode(a.message_id),
+        other_message_id = %hex::encode(b.message_id)
+    );
+    let _entered = span.enter();
     if a.source_account != b.source_account || a.sequence != b.sequence {
         return None;
     }
@@ -78,6 +84,15 @@ pub fn detect_conflicts(slots: &[QueuedSlot]) -> Vec<Conflict> {
     for ((account, sequence), mut ids) in groups {
         ids.sort();
         ids.dedup();
+        for message_id in &ids {
+            tracing::info_span!(
+                "conflict_candidate",
+                message_id = %hex::encode(message_id),
+                source_account = %account,
+                sequence
+            )
+            .in_scope(|| tracing::info!("candidate inspected"));
+        }
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 conflicts.push(Conflict {
@@ -130,6 +145,15 @@ pub fn detect_nway_conflicts(slots: &[QueuedSlot]) -> Vec<NWayConflict> {
     for ((source_account, sequence), mut ids) in groups {
         ids.sort();
         ids.dedup();
+        for message_id in &ids {
+            tracing::info_span!(
+                "conflict_candidate",
+                message_id = %hex::encode(message_id),
+                source_account = %source_account,
+                sequence
+            )
+            .in_scope(|| tracing::info!("candidate inspected"));
+        }
         if ids.len() >= 2 {
             conflicts.push(NWayConflict {
                 source_account,

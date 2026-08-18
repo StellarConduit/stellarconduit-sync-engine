@@ -218,6 +218,33 @@ cargo fmt --all
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
+### Structured Lifecycle Tracing
+
+The envelope lifecycle is instrumented with `tracing` spans keyed by each
+envelope's `message_id`. Enable the output while running the mock relay or a
+test with `RUST_LOG`:
+
+```bash
+RUST_LOG=stellarconduit_sync_engine=info cargo run --example mock_relay
+RUST_LOG=stellarconduit_sync_engine::settlement=trace cargo test settlement -- --nocapture
+```
+
+For JSON output suitable for external tooling, initialize a
+`tracing_subscriber` JSON formatter in the embedding application:
+
+```rust,no_run
+tracing_subscriber::fmt()
+        .json()
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::FULL)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
+```
+
+Filter one `message_id` in the resulting records. The `envelope_state` spans
+cover time spent in `queued`, `propagating`, or another settlement state, and
+the transition event includes `state_duration_ms`; queue, storage, signing,
+and conflict records use the same identifier.
+
 ---
 
 ## Testing

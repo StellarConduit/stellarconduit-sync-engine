@@ -266,7 +266,7 @@ impl SyncEngine {
         // envelope queued and report nothing dispatchable so the caller can
         // retry — we never hand out an envelope whose dispatch wasn't recorded.
         if let Err(err) = self.persist_dispatch_status(message_id, updated_at) {
-            log::error!(
+            tracing::error!(
                 "failed to persist dispatch status for {}: {err}; leaving envelope queued",
                 hex::encode(message_id)
             );
@@ -287,7 +287,7 @@ impl SyncEngine {
             .settlement
             .transition(envelope.message_id, SettlementStatus::Propagating)
         {
-            log::warn!(
+            tracing::warn!(
                 "in-memory tracker did not advance to Propagating for {}: {err} \
                  (durable marker already persisted)",
                 hex::encode(envelope.message_id)

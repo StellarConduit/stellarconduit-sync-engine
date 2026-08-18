@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::time::Instant;
 
 use crate::errors::SyncEngineError;
 
@@ -75,6 +76,8 @@ impl FromStr for SettlementStatus {
 #[derive(Debug, Default)]
 pub struct SettlementTracker {
     statuses: HashMap<[u8; 32], SettlementStatus>,
+    state_spans: HashMap<[u8; 32], tracing::Span>,
+    state_started_at: HashMap<[u8; 32], Instant>,
 }
 
 impl SettlementTracker {
@@ -85,6 +88,18 @@ impl SettlementTracker {
     /// Register a newly-queued envelope. Fresh entries always start `Queued`.
     pub fn track(&mut self, message_id: [u8; 32]) {
         self.statuses.insert(message_id, SettlementStatus::Queued);
+        let span = tracing::info_span!(
+            "envelope_state",
+            message_id = %hex::encode(message_id),
+            state = SettlementStatus::Queued.as_str()
+        );
+        self.state_spans.insert(message_id, span);
+        self.state_started_at.insert(message_id, Instant::now());
+        tracing::info!(
+            message_id = %hex::encode(message_id),
+            state = SettlementStatus::Queued.as_str(),
+            "envelope entered settlement state"
+        );
     }
 
     /// Restore an envelope directly to `status`, bypassing transition
@@ -94,6 +109,14 @@ impl SettlementTracker {
     /// transitions.
     pub fn restore(&mut self, message_id: [u8; 32], status: SettlementStatus) {
         self.statuses.insert(message_id, status);
+        let span = tracing::info_span!(
+            "envelope_state",
+            message_id = %hex::encode(message_id),
+            state = status.as_str(),
+            restored = true
+        );
+        self.state_spans.insert(message_id, span);
+        self.state_started_at.insert(message_id, Instant::now());
     }
 
     pub fn status(&self, message_id: &[u8; 32]) -> Option<SettlementStatus> {
@@ -120,7 +143,26 @@ impl SettlementTracker {
             });
         }
 
+        let elapsed = self
+            .state_started_at
+            .remove(&message_id)
+            .map(|started| started.elapsed());
+        self.state_spans.remove(&message_id);
         self.statuses.insert(message_id, next);
+        let next_span = tracing::info_span!(
+            "envelope_state",
+            message_id = %hex::encode(message_id),
+            state = next.as_str()
+        );
+        self.state_spans.insert(message_id, next_span);
+        self.state_started_at.insert(message_id, Instant::now());
+        tracing::info!(
+            message_id = %hex::encode(message_id),
+            from_status = current.as_str(),
+            to_status = next.as_str(),
+            state_duration_ms = elapsed.map_or(0, |duration| duration.as_millis() as u64),
+            "settlement transition"
+        );
         Ok(())
     }
 }
@@ -128,6 +170,122 @@ impl SettlementTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::{Context, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone, Default)]
+    struct Capture {
+        spans: Arc<Mutex<Vec<(String, String)>>>,
+        events: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    struct FieldVisitor(String);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push_str(&format!(" {field}={value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push_str(&format!(" {field}={value}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'span> LookupSpan<'span>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: Context<'_, S>,
+        ) {
+            let mut fields = FieldVisitor(String::new());
+            attrs.record(&mut fields);
+            self.spans
+                .lock()
+                .unwrap()
+                .push((attrs.metadata().name().to_string(), fields.0));
+        }
+
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let mut fields = FieldVisitor(String::new());
+            event.record(&mut fields);
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.metadata().name().to_string(), fields.0));
+        }
+    }
+
+    fn captured_subscriber(capture: &Capture) -> impl tracing::Subscriber {
+        tracing_subscriber::registry().with(capture.clone())
+    }
+
+    #[test]
+    fn test_full_lifecycle_emits_correlated_spans_for_single_message_id() {
+        let capture = Capture::default();
+        let message_id = [0xabu8; 32];
+
+        tracing::subscriber::with_default(captured_subscriber(&capture), || {
+            let mut tracker = SettlementTracker::new();
+            tracker.track(message_id);
+            tracker
+                .transition(message_id, SettlementStatus::Propagating)
+                .unwrap();
+            tracker
+                .transition(message_id, SettlementStatus::Settled)
+                .unwrap();
+        });
+
+        let spans = capture.spans.lock().unwrap();
+        let events = capture.events.lock().unwrap();
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|(name, _)| name == "envelope_state")
+                .count(),
+            3
+        );
+        assert!(spans
+            .iter()
+            .all(|(_, fields)| fields.contains("message_id")));
+        assert!(events.iter().any(|(_, fields)| {
+            fields.contains("envelope entered settlement state") && fields.contains("message_id")
+        }));
+        assert!(events.iter().any(|(_, fields)| {
+            fields.contains("settlement transition") && fields.contains("message_id")
+        }));
+    }
+
+    #[test]
+    fn test_span_timing_reflects_actual_elapsed_state_duration() {
+        let capture = Capture::default();
+        let message_id = [0xcdu8; 32];
+
+        tracing::subscriber::with_default(captured_subscriber(&capture), || {
+            let mut tracker = SettlementTracker::new();
+            tracker.track(message_id);
+            tracker
+                .transition(message_id, SettlementStatus::Propagating)
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            tracker
+                .transition(message_id, SettlementStatus::Settled)
+                .unwrap();
+        });
+
+        assert!(capture.events.lock().unwrap().iter().any(|(_, fields)| {
+            fields.contains("settlement transition")
+                && fields
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("state_duration_ms="))
+                    .and_then(|duration| duration.parse::<u128>().ok())
+                    .is_some_and(|duration| duration >= 15)
+        }));
+    }
 
     #[test]
     fn test_happy_path_queued_to_settled() {

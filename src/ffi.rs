@@ -274,7 +274,7 @@ pub extern "C" fn sse_engine_open(db_path_ptr: *const c_char) -> *mut SseEngineH
                 inner: Mutex::new(engine),
             })),
             Err(err) => {
-                log::error!("sse_engine_open failed: {err}");
+                tracing::error!("sse_engine_open failed: {err}");
                 ptr::null_mut()
             }
         }
@@ -419,7 +419,7 @@ pub extern "C" fn sse_queue_payment(
                 Err(_) => ptr::null_mut(),
             },
             Err(err) => {
-                log::warn!("sse_queue_payment failed: {err}");
+                tracing::warn!("sse_queue_payment failed: {err}");
                 ptr::null_mut()
             }
         }
@@ -502,7 +502,7 @@ pub extern "C" fn sse_list_unresolved_conflicts(handle: *mut SseEngineHandle) ->
                 Err(_) => ptr::null_mut(),
             },
             Err(err) => {
-                log::warn!("sse_list_unresolved_conflicts failed: {err}");
+                tracing::warn!("sse_list_unresolved_conflicts failed: {err}");
                 ptr::null_mut()
             }
         }
