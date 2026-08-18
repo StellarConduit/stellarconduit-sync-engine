@@ -184,11 +184,11 @@ mod tests {
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.push_str(&format!(" {}={field} {value:?}"));
+            self.0.push_str(&format!(" {field}={value:?}"));
         }
 
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.push_str(&format!(" {}={field} {value}"));
+            self.0.push_str(&format!(" {field}={value}"));
         }
     }
 
