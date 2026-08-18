@@ -135,6 +135,12 @@ impl SyncEngineDb {
         priority: TxPriority,
         enqueued_at: u64,
     ) -> Result<(), SyncEngineError> {
+        let span = tracing::info_span!(
+            "envelope_storage_write",
+            message_id = %hex::encode(envelope.message_id),
+            operation = "enqueue_envelope"
+        );
+        let _entered = span.enter();
         let message_id = envelope.message_id.to_vec();
         let envelope_bytes = rmp_serde::to_vec(envelope)?;
         let source_account = source_account.to_string();
@@ -181,6 +187,12 @@ impl SyncEngineDb {
         priority: TxPriority,
         enqueued_at: u64,
     ) -> Result<(), SyncEngineError> {
+        let span = tracing::info_span!(
+            "envelope_storage_write",
+            message_id = %hex::encode(envelope.message_id),
+            operation = "enqueue_transaction"
+        );
+        let _entered = span.enter();
         let message_id = envelope.message_id.to_vec();
         let envelope_bytes = rmp_serde::to_vec(envelope)?;
         let source_account = source_account.to_string();
@@ -333,6 +345,12 @@ impl SyncEngineDb {
         status: SettlementStatus,
         updated_at: u64,
     ) -> Result<(), SyncEngineError> {
+        let span = tracing::info_span!(
+            "settlement_storage_write",
+            message_id = %hex::encode(message_id),
+            to_status = status.as_str()
+        );
+        let _entered = span.enter();
         let id = message_id.to_vec();
         let status_str = status.as_str().to_string();
         self.conn

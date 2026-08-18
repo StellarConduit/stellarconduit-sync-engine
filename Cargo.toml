@@ -71,13 +71,12 @@ tokio = { version = "1.37", features = ["full"] }
 # Persistence
 rusqlite = { version = "0.31", features = ["bundled"] }
 tokio-rusqlite = "0.5"
+tracing = "0.1"
 
 # Utilities
 thiserror = "1.0"
 chrono = "0.4"
 hex = "0.4"
-log = "0.4"
-env_logger = "0.11"
 
 [dev-dependencies]
 tokio-test = "0.4"
@@ -100,6 +99,7 @@ proptest = "1.5"
 # themselves were added in a prior PR without this dependency, which left
 # `cargo clippy --all-targets` / `cargo test --workspace` unable to compile.
 criterion = "0.5"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 
 [[test]]

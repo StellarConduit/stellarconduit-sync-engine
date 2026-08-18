@@ -247,6 +247,13 @@ impl OutboundTxQueue {
         priority: TxPriority,
         enqueued_at: u64,
     ) -> Result<(), SyncEngineError> {
+        let span = tracing::info_span!(
+            "envelope_queued",
+            message_id = %hex::encode(envelope.message_id),
+            priority = ?priority,
+            enqueued_at
+        );
+        let _entered = span.enter();
         if priority == TxPriority::Emergency {
             if let Some(guard) = &mut self.emergency_guard {
                 guard.check(enqueued_at)?;
@@ -273,6 +280,13 @@ impl OutboundTxQueue {
         priority: TxPriority,
         enqueued_at: u64,
     ) {
+        let span = tracing::info_span!(
+            "envelope_restored_to_queue",
+            message_id = %hex::encode(envelope.message_id),
+            priority = ?priority,
+            enqueued_at
+        );
+        let _entered = span.enter();
         if priority == TxPriority::Emergency {
             if let Some(guard) = &mut self.emergency_guard {
                 guard.record(enqueued_at);
@@ -286,7 +300,14 @@ impl OutboundTxQueue {
     }
 
     pub fn pop(&mut self) -> Option<TransactionEnvelope> {
-        self.heap.pop().map(|q| q.envelope)
+        let envelope = self.heap.pop().map(|q| q.envelope);
+        if let Some(envelope) = &envelope {
+            tracing::info!(
+                message_id = %hex::encode(envelope.message_id),
+                "envelope dispatched from queue"
+            );
+        }
+        envelope
     }
 
     pub fn peek(&self) -> Option<&TransactionEnvelope> {
