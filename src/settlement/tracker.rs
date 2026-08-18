@@ -204,19 +204,19 @@ mod tests {
         ) {
             let mut fields = FieldVisitor(String::new());
             attrs.record(&mut fields);
-            self.spans.lock().unwrap().push((
-                attrs.metadata().name().to_string(),
-                fields.0,
-            ));
+            self.spans
+                .lock()
+                .unwrap()
+                .push((attrs.metadata().name().to_string(), fields.0));
         }
 
         fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
             let mut fields = FieldVisitor(String::new());
             event.record(&mut fields);
-            self.events.lock().unwrap().push((
-                event.metadata().name().to_string(),
-                fields.0,
-            ));
+            self.events
+                .lock()
+                .unwrap()
+                .push((event.metadata().name().to_string(), fields.0));
         }
     }
 
@@ -243,10 +243,15 @@ mod tests {
         let spans = capture.spans.lock().unwrap();
         let events = capture.events.lock().unwrap();
         assert_eq!(
-            spans.iter().filter(|(name, _)| name == "envelope_state").count(),
+            spans
+                .iter()
+                .filter(|(name, _)| name == "envelope_state")
+                .count(),
             3
         );
-        assert!(spans.iter().all(|(_, fields)| fields.contains("message_id")));
+        assert!(spans
+            .iter()
+            .all(|(_, fields)| fields.contains("message_id")));
         assert!(events.iter().any(|(name, fields)| {
             name.contains("envelope entered settlement state") && fields.contains("message_id")
         }));
