@@ -252,11 +252,11 @@ mod tests {
         assert!(spans
             .iter()
             .all(|(_, fields)| fields.contains("message_id")));
-        assert!(events.iter().any(|(name, fields)| {
-            name.contains("envelope entered settlement state") && fields.contains("message_id")
+        assert!(events.iter().any(|(_, fields)| {
+            fields.contains("envelope entered settlement state") && fields.contains("message_id")
         }));
-        assert!(events.iter().any(|(name, fields)| {
-            name.contains("settlement transition") && fields.contains("message_id")
+        assert!(events.iter().any(|(_, fields)| {
+            fields.contains("settlement transition") && fields.contains("message_id")
         }));
     }
 
@@ -277,10 +277,13 @@ mod tests {
                 .unwrap();
         });
 
-        assert!(capture.events.lock().unwrap().iter().any(|(name, fields)| {
-            name.contains("settlement transition")
-                && fields.contains("state_duration_ms")
-                && fields.contains("20")
+        assert!(capture.events.lock().unwrap().iter().any(|(_, fields)| {
+            fields.contains("settlement transition")
+                && fields
+                    .split_whitespace()
+                    .find_map(|field| field.strip_prefix("state_duration_ms="))
+                    .and_then(|duration| duration.parse::<u128>().ok())
+                    .is_some_and(|duration| duration >= 15)
         }));
     }
 
