@@ -1,7 +1,11 @@
+pub mod causal;
 pub mod detector;
 pub mod escalation;
 pub mod resolver;
 
+pub use causal::{
+    causal_relation, CausalClock, CausalEnvelope, CausalRelation, DeviceId, MAX_CLOCK_ENTRIES,
+};
 pub use detector::{
     conflicts_between, detect_conflicts, detect_nway_conflicts, Conflict, NWayConflict, QueuedSlot,
 };
