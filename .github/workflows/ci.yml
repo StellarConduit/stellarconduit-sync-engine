@@ -97,7 +97,7 @@ jobs:
         # the built-in --output-format=bencher flag (compatible with the
         # benchmark-action tool) by setting CRITERION_HOME and relying on the
         # default JSON output written to target/criterion/.
-        run: cargo bench --bench queue_throughput --bench storage_throughput --bench conflict_detection -- --output-format=bencher 2>&1 | tee bench_output.txt
+        run: cargo bench --bench queue_throughput --bench storage_throughput --bench conflict_detection --bench zk_spend_proof -- --output-format=bencher 2>&1 | tee bench_output.txt
 
       - name: Store benchmark results (main branch only)
         if: github.ref == 'refs/heads/main'
@@ -131,3 +131,10 @@ jobs:
           fail-on-alert: true
           gh-pages-branch: gh-pages
           benchmark-data-dir-path: bench
+          # Skip fetching the gh-pages branch when no baseline has been stored
+          # yet (i.e. the branch does not exist). Without this flag the step
+          # fails with "couldn't find remote ref gh-pages" on every PR until
+          # at least one push to main has successfully written a baseline —
+          # which can never happen while this flag is absent and every PR is
+          # blocked. Once a baseline exists on gh-pages this flag is a no-op.
+          skip-fetch-gh-pages: true
