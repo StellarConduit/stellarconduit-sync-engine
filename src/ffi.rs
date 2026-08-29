@@ -395,6 +395,7 @@ pub extern "C" fn sse_queue_payment(
             Some(k) => k,
             None => return ptr::null_mut(),
         };
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(signing_key);
         let priority = match TxPriority::try_from(priority as i64) {
             Ok(p) => p,
             Err(_) => return ptr::null_mut(),
@@ -407,7 +408,7 @@ pub extern "C" fn sse_queue_payment(
 
         let result = runtime().block_on(engine.queue_payment(
             source_account,
-            &signing_key,
+            &signer,
             tx_xdr.to_string(),
             priority,
             ttl_hops,

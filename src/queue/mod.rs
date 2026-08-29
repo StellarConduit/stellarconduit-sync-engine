@@ -1,5 +1,6 @@
 pub mod dispatch;
 pub mod priority;
+pub mod reputation;
 pub mod sequence;
 pub mod spendable;
 pub mod vdf_ordering;

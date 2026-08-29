@@ -371,6 +371,49 @@ mod tests {
         assert_eq!(loaded, Some(105));
     }
 
+    /// Issue #51: a lookup for a *present* account must not be
+    /// distinguishable, by timing, from a lookup for an *absent* one.
+    ///
+    /// `#[ignore]` by default — wall-clock timing is machine- and
+    /// load-dependent, so this belongs in a dedicated, repeated timing job
+    /// (see `docs/design/side-channel-resistant-signing.md`), not the
+    /// ordinary `cargo test` run. The statistical method it relies on
+    /// ([`crate::timing::mann_whitney_u`]) is itself covered by
+    /// deterministic unit tests that do run in CI. Run this one explicitly
+    /// with `cargo test -- --ignored does_not_correlate_with_account_presence`.
+    #[test]
+    #[ignore = "timing-sensitive; run in a dedicated timing job (see docs/design/side-channel-resistant-signing.md)"]
+    fn test_sequence_lookup_timing_does_not_correlate_with_account_presence() {
+        use crate::timing::mann_whitney_u;
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let mut mgr = SequenceReservationManager::new();
+        mgr.seed("GPRESENT", 100);
+
+        const TRIALS: usize = 20_000;
+        let mut present = Vec::with_capacity(TRIALS);
+        let mut absent = Vec::with_capacity(TRIALS);
+
+        for _ in 0..TRIALS {
+            let start = Instant::now();
+            let _ = black_box(mgr.last_reserved(black_box("GPRESENT")));
+            present.push(start.elapsed().as_nanos() as f64);
+
+            let start = Instant::now();
+            let _ = black_box(mgr.last_reserved(black_box("GMISSING")));
+            absent.push(start.elapsed().as_nanos() as f64);
+        }
+
+        let result = mann_whitney_u(&present, &absent);
+        // Two-sided alpha = 1e-3 corresponds to a |z| threshold of 3.2905.
+        assert!(
+            !result.differs_at(3.2905),
+            "sequence-lookup timing correlates with account presence: z = {:.3}",
+            result.z_score
+        );
+    }
+
     #[test]
     fn test_multisig_registry_seed_and_lookup() {
         let mut registry = MultisigAccountRegistry::new();

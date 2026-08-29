@@ -35,6 +35,7 @@ async fn test_reserve_sign_persist_and_settle() {
     let db = SyncEngineDb::init(":memory:").await.unwrap();
     let mut sequences = SequenceReservationManager::new();
     let signing_key = SigningKey::generate(&mut OsRng);
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key.clone());
     let source_account = SOURCE_G;
 
     // A device that last saw connectivity knows the account's on-chain
@@ -46,7 +47,7 @@ async fn test_reserve_sign_persist_and_settle() {
     let (hybrid, sequence) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences,
         source_account,
-        &signing_key,
+        &signer,
         &SigningPolicy::ClassicalOnly,
         fixture("transaction_v1_envelope.b64"),
         10,
@@ -125,6 +126,8 @@ async fn test_conflicting_envelopes_for_same_slot_are_detected_and_recorded() {
     let db = SyncEngineDb::init(":memory:").await.unwrap();
     let key_a = SigningKey::generate(&mut OsRng);
     let key_b = SigningKey::generate(&mut OsRng);
+    let signer_a = stellarconduit_sync_engine::envelope::InMemorySigner::new(key_a.clone());
+    let signer_b = stellarconduit_sync_engine::envelope::InMemorySigner::new(key_b.clone());
     let source_account = SOURCE_G;
 
     // Two devices sharing the same account, both offline, each builds a
@@ -137,7 +140,7 @@ async fn test_conflicting_envelopes_for_same_slot_are_detected_and_recorded() {
     let (hybrid_a, seq_a) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences_a,
         source_account,
-        &key_a,
+        &signer_a,
         &SigningPolicy::ClassicalOnly,
         fixture("transaction_v1_envelope.b64"),
         10,
@@ -150,7 +153,7 @@ async fn test_conflicting_envelopes_for_same_slot_are_detected_and_recorded() {
     let (hybrid_b, seq_b) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences_b,
         source_account,
-        &key_b,
+        &signer_b,
         &SigningPolicy::ClassicalOnly,
         // Same source and sequence, different payment: a genuinely conflicting
         // envelope, not a duplicate.

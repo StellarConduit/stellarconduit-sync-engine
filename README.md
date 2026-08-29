@@ -114,6 +114,7 @@ Detects and (eventually) resolves double-spend conflicts arising from split mesh
 - `detector`: structural detection — two different envelopes claiming the same (account, sequence) slot can never both settle on-chain
 - `resolver`: **the hard centerpiece** — deterministic off-chain resolution from a Sybil-resistant quorum of verified `RelayChainProof`s. `quorum_standing` exposes *why* a conflict is unresolved; conflicts it still can't settle escalate on-chain.
 - `vrf_tiebreak`: last-resort step for a genuine quorum-met tie — a `schnorrkel` VRF, evaluated by a deterministically-selected relay (never a conflicting party), producing a tie-break that is unpredictable in advance yet independently verifiable by anyone.
+- `proof_compression`: folds an arbitrarily long relay chain's per-hop `RelayChainProof`s into a constant-size `CompressedChainProof` (a hash-based recursive/IVC accumulator with a bounded tail of relay attestations). On-chain verification cost is flat in hop count instead of linear, so a legitimately long chain stays escalatable within a Soroban budget. New hops fold in incrementally as the envelope propagates. Trade-off (documented in the module): for chains longer than `TAIL_WINDOW`, the pre-tail prefix rests on the tail relays' recursive attestations rather than independent re-checking — a *working but not-yet-production* scheme, per issue #63. See `cargo run --release --example compression_bench`.
 
 ---
 

@@ -36,12 +36,13 @@ fn fixture(name: &str) -> String {
 
 /// Build one signed envelope's `message_id` for the shared slot.
 fn build_message_id(key: &SigningKey, xdr_fixture: &str) -> [u8; 32] {
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let mut sequences = SequenceReservationManager::new();
     sequences.seed(SOURCE_G, SEQ - 1);
     let (hybrid, seq) = OfflineEnvelopeBuilder::build_and_sign(
         &mut sequences,
         SOURCE_G,
-        key,
+        &signer,
         &SigningPolicy::ClassicalOnly,
         fixture(xdr_fixture),
         10,

@@ -74,11 +74,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -95,6 +96,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
@@ -102,7 +104,7 @@ mod tests {
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -122,6 +124,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
@@ -129,7 +132,7 @@ mod tests {
         let (mut hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -153,6 +156,7 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let pq_keypair = pqcrypto_dilithium::dilithium2::keypair();
         let policy = SigningPolicy::Hybrid(Box::new(pq_keypair.0), Box::new(pq_keypair.1));
@@ -160,7 +164,7 @@ mod tests {
         let (hybrid_env, _) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &policy,
             fixture("transaction_v1_envelope.b64"),
             10,

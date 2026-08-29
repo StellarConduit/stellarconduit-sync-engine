@@ -44,7 +44,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::SigningKey;
+use crate::envelope::secure_signing::KeySigner;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
 use crate::envelope::OfflineEnvelopeBuilder;
@@ -206,7 +206,7 @@ impl SyncEngine {
     pub async fn queue_payment(
         &mut self,
         source_account: &str,
-        signing_key: &SigningKey,
+        signer: &dyn KeySigner,
         tx_xdr: impl Into<String>,
         priority: TxPriority,
         ttl_hops: u8,
@@ -222,7 +222,7 @@ impl SyncEngine {
         let (hybrid_env, sequence) = OfflineEnvelopeBuilder::build_and_sign(
             &mut self.sequences,
             source_account,
-            signing_key,
+            signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             tx_xdr,
             ttl_hops,

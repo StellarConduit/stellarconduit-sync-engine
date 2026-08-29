@@ -12,3 +12,4 @@ pub mod settlement;
 pub mod sim;
 pub mod stellar_address;
 pub mod storage;
+pub mod timing;

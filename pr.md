@@ -1,62 +1,113 @@
-# Database Export/Import for Device Migration
+# Compression-Oracle Side-Channel Mitigation for At-Rest Envelope Compression
 
-Addresses #15.
+Closes #93.
 
 ## Problem
 
-There was no way to move a `SyncEngineDb`'s state — pending payments, sequence reservations, unresolved conflicts, dispute escalations, settlement history — from one device to another. For the population StellarConduit targets (disaster-relief/displacement scenarios), losing that state because a phone was lost, broken, or replaced means losing pending offline payments that may represent emergency funds.
+Issue #56 wants queued `TransactionEnvelope` blobs compressed before issue #12's
+AES-256-GCM encryption writes them to SQLite — the textbook *compress-then-encrypt*
+pipeline, and the exact shape behind CRIME/BREACH. The transaction **memo**
+(attacker-influenceable: a co-located app can make this device queue a payment
+whose memo it chose) and the **destination / amount** (secret) are all encoded
+in the single `tx_xdr` base64 string. Compress that in one DEFLATE context and
+the compressed length becomes a byte-at-a-time oracle for the secret fields,
+observable through database-file or backup size.
 
-## What's here
+> **Note on #56.** #56 is still open and unimplemented — there is no envelope
+> compression in the crate yet. This PR *defines* the at-rest compression scheme
+> (`compress_at_rest` / `decompress_at_rest`) with the oracle mitigation built in
+> from the start. It is **not** wired into `SyncEngineDb`'s write path — that
+> integration, and the legacy-row migration, are left for #56; the frame format
+> already carries the magic-byte discriminator it will need.
 
-Two new methods on `SyncEngineDb` (`src/storage/db.rs`):
+## Context-separation analysis
 
-- `export_snapshot(&self) -> Result<Vec<u8>, SyncEngineError>` — serializes every table into a single versioned MessagePack blob.
-- `import_snapshot(&self, data: &[u8]) -> Result<ImportReport, SyncEngineError>` — restores a blob produced by `export_snapshot` into this database.
+`tx_xdr` is the **one and only** shared compression context. Every other envelope
+field (`message_id`, `origin_pubkey`, `ttl_hops`, `timestamp`, `signature`) is a
+hash, a public key, a small int, or a random-looking signature — not
+attacker-chosen, no shared redundancy with a memo. Within `tx_xdr`: the memo
+value versus {destination account, amount, source account}, which sit 16–70
+bytes apart, well inside one DEFLATE window.
 
-Snapshot rows mirror table columns directly (rather than going through the domain types used elsewhere in this file, e.g. `Conflict`/`DisputeEscalation`), so the round-trip is byte-exact instead of passing through a second encode/decode step that could silently normalize or lose data.
+Full analysis, attacker model (co-located app / backup-size observer — **not** a
+network attacker; no adaptive-feedback loop), rejected alternatives, and residual
+accounting: **`docs/design/compression-oracle-mitigation.md`**.
 
-## Versioning (issue #11)
+## Mitigation (`CompressionScheme::Mitigated`)
 
-Issue #11 (schema versioning/migrations for `SyncEngineDb`) hadn't landed at the time this was picked up, so this adds its own minimal, standalone tag — `DB_SNAPSHOT_SCHEMA_VERSION` — scoped only to the snapshot format, rather than inventing a general migration scheme. `import_snapshot` rejects any blob whose embedded version doesn't match, via a new `SyncEngineError::IncompatibleSnapshotSchemaVersion`. If #11 lands later, this constant should be unified with its scheme, not kept as a second, competing version number.
+1. **Separate compression contexts.** Parse the XDR (reusing `src/envelope/xdr.rs`'s
+   pattern), lift the `Memo` into its **own** independent DEFLATE stream, compress
+   the memo-blanked remainder in a **second** stream. No shared window/dictionary
+   ⇒ a cross-context LZ77 match is structurally impossible. `compress_at_rest`
+   self-checks bit-exact reassembly and falls back to opaque whole-blob
+   compression for non-canonical / unparseable `tx_xdr`.
+2. **Length quantization.** Frame zero-padded to
+   `16 + pad16(attacker_len) + pad16(secret_len)`; decompression uses the exact
+   recorded lengths so padding is inert. Resolves the secret stream's size only to
+   a 16-byte bucket, removing the ~1-byte granularity the oracle needs.
+3. **No adaptive dictionary** — deliberately none; a dictionary seeded with memo
+   content is the same bug in a new shape.
 
-## Import policy: reject into a non-empty database
+## Measurement harness (`src/storage/compression_oracle.rs`)
 
-`import_snapshot` **rejects the import** (`SyncEngineError::ImportTargetNotEmpty`) if the target database already contains any rows, in any table. It does not merge or overwrite.
+Deterministic byte-at-a-time recovery attack (BREACH-style known-prefix +
+multi-round majority vote against Huffman quantization), modelling a strong
+attacker with exact per-write size observation. Attacks **both** schemes:
 
-This was a deliberate choice over merge/overwrite: every table here guards financial or double-spend-sensitive state. Silently merging two `sequence_reservations` rows for the same account, or two `conflicts`/`queued_envelopes` rows, would need a conflict-resolution policy no less complex than the one `crate::conflict` already exists to implement for on-chain envelopes — inventing a second, weaker one just for import risks the exact double-spend and lost-payment hazards this crate is otherwise built to prevent. Reject-if-nonempty keeps the outcome trivially provable (`empty + snapshot = snapshot`, exactly) and matches the issue's intended use case: restoring onto a new device, whose database is normally fresh.
+| Target secret | Unmitigated | Mitigated |
+|---------------|-------------|-----------|
+| Payment amount, low 4 bytes (top 4 known) | **24 bits (3/4 bytes)** | **0 bits (0/4)** |
+| Destination account, 4 bytes (8-byte prefix known) | **16 bits (2/4 bytes)** | **0 bits (0/4)** |
+| Low-entropy fixture amount `0x0EE6B280` (end-to-end w/ AES-GCM) | **8 bits (1/4 bytes)** | **0 bits (0/4)** |
 
-The emptiness check and the row inserts happen inside a single SQLite transaction, so a concurrent writer landing between "check" and "insert" can't produce a partial or corrupt import — `SyncEngineDb` is designed to be shared behind an `Arc` across concurrent callers, so this isn't a hypothetical.
+Cross-context leakage is **eliminated** (mitigated secret stream is byte-identical
+regardless of memo). Residual, disclosed honestly in the design doc:
+*intra-secret* leakage is **reduced, not zero** — an attacker forcing very many
+writes of the same secret can still detect a 16-byte-bucket boundary crossing
+(≤ 1 bit per crossing, 0 mid-bucket).
 
-## Interaction with encryption at rest (issue #12)
+## Compression ratio (canonical fixture payment)
 
-Issue #12 hadn't landed either, so this format has no encryption of its own — `export_snapshot` reads and serializes whatever plaintext rows the connection can see. This is documented explicitly on both functions: **an exported snapshot is not an encrypted artifact merely because the source database is encrypted at rest.** Encryption at rest protects the on-disk SQLite file, not the output of `export_snapshot`. A snapshot is exactly as sensitive as the payment history it contains (source accounts, sequence numbers, full transaction envelopes, dispute proofs) and callers must treat it as plaintext financial data: transmit only over an encrypted channel, don't persist it unencrypted at rest, and ideally wrap it in caller-side encryption (using the same key material as #12's at-rest encryption, so a snapshot is never a plaintext copy of something the source database was encrypting) before writing it anywhere.
+| | Bytes | % of raw |
+|---|-------|----------|
+| `rmp_serde(TransactionEnvelope)` (today) | 443 | 100 % |
+| Unmitigated frame | 127 | 28.7 % |
+| **Mitigated frame** | **144** | **32.5 %** |
 
-## Interaction with stale sequence reservations (issue #8)
+~3× reduction retained; mitigation costs 17 bytes vs the vulnerable baseline.
 
-`sequence_reservations` rows are exported and imported as-is. A sequence baseline reserved on the source device may be stale by the time it reaches the target device (e.g. the account transacted from elsewhere in the interim). This is documented as a required post-import step, not implemented here: **callers must run stale-sequence reconciliation (#8) immediately after `import_snapshot` returns and before queuing anything new** — this function has no live network access to the account and can't validate the reservation itself.
+## Changes
 
-## Corrupted / truncated input
+- `src/storage/envelope_compression.rs` *(new)* — `CompressionScheme`,
+  `compress_at_rest` / `decompress_at_rest`, memo/secret decomposition, framing,
+  `oracle_observable`, `compressed_segment_sizes`.
+- `src/storage/compression_oracle.rs` *(new)* — `run_byte_at_a_time_oracle`,
+  `OracleConfig` / `OracleReport`, `SecretField`.
+- `src/storage/mod.rs` — module decls + re-exports.
+- `src/errors.rs` — `SyncEngineError::CompressionError` (classified `Permanent`) +
+  `classify()` arm + variant checklist + doc table row.
+- `Cargo.toml` — `miniz_oxide = "0.8"` (pure-Rust DEFLATE; justification comment
+  in-file), `[[test]]` for the new integration test.
+- `docs/design/compression-oracle-mitigation.md` *(new)*.
+- `tests/integration/compression_oracle_test.rs` *(new)* — end-to-end through the
+  real `EncryptedData` AES-GCM pipeline; proves GCM's +28-byte overhead preserves
+  (doesn't mask) the quantization buckets.
 
-A `data` blob that isn't a valid, complete snapshot encoding fails with `SyncEngineError::DeserializationError` before anything is written — there's no partial-write state to reason about, and no panic path.
+## Tests
 
-## Testing
+Required (all present, passing):
 
-Required tests, all in `src/storage/db.rs`:
-- `test_export_import_roundtrip_is_lossless` — seeds every table, exports, imports into a fresh database, and asserts every table matches exactly (including `DbSummary`, ordered comparisons for envelopes/conflicts/escalations/history/reservations).
-- `test_import_into_nonempty_db_follows_documented_policy` — importing into a database with existing rows returns `ImportTargetNotEmpty`, and neither the target's pre-existing rows nor the snapshot's rows are mutated.
-- `test_import_rejects_corrupted_snapshot` — both garbage bytes and a truncated real snapshot fail with `DeserializationError`, and nothing is written either time.
-- `test_import_rejects_incompatible_schema_version` — a snapshot tagged with `DB_SNAPSHOT_SCHEMA_VERSION + 1` is rejected with `IncompatibleSnapshotSchemaVersion` before any table is touched.
+- `test_unmitigated_baseline_leaks_secret_byte_via_compressed_length`
+- `test_mitigated_implementation_reduces_oracle_signal`
+- `test_attacker_influenceable_and_secret_fields_use_separate_compression_contexts`
+- `test_compression_still_provides_meaningful_size_reduction_after_mitigation`
+
+Plus: both-scheme round-trip (incl. fee-bump, muxed, MEMO_HASH, non-parseable
+fallback), corrupt-frame rejection without panic, destination-field recovery,
+and the 4 end-to-end integration tests.
 
 ```
-cargo fmt --all -- --check                          # clean
-cargo clippy --all-targets -- -D warnings           # clean
-cargo test                                           # 172 unit + 13 integration passed, 0 failed
+cargo fmt --all --check           # clean
+cargo clippy --all-targets -- -D warnings   # clean
+cargo test                        # 263 lib + all integration/sim, 0 failures
 ```
-
-Note: this repo's pinned `stellarconduit-core` git dependency fails to build natively on macOS (`mdns-sd` is gated to `cfg(target_os = "linux")` in its `Cargo.toml`, but two of its modules use it unconditionally with no matching `#[cfg]`). This is pre-existing on `main` and unrelated to this change — verified via a temporary local-only patch to the cached dependency checkout (reverted afterward, nothing in this repo touched) since CI runs on `ubuntu-latest` where it's a non-issue.
-
-## Commits
-
-1. `errors: add error variants for snapshot export/import`
-2. `storage: implement snapshot export/import for device migration`
-3. `storage: add required tests for snapshot export/import`

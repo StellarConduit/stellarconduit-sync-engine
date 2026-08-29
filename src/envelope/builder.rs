@@ -18,11 +18,10 @@
 
 use std::collections::HashMap;
 
-use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
-use stellarconduit_core::message::envelope::EnvelopeBuilder;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
+use crate::envelope::secure_signing::KeySigner;
 use crate::envelope::xdr::{extract_source_account_and_sequence, with_updated_sequence};
 use crate::errors::SyncEngineError;
 use crate::queue::{MultisigAccountRegistry, SequenceReservationManager};
@@ -54,7 +53,7 @@ impl OfflineEnvelopeBuilder {
     pub fn build_and_sign(
         sequences: &mut SequenceReservationManager,
         source_account: &str,
-        signing_key: &SigningKey,
+        signer: &dyn KeySigner,
         policy: &crate::envelope::pq::SigningPolicy,
         tx_xdr: impl Into<String>,
         ttl_hops: u8,
@@ -84,10 +83,27 @@ impl OfflineEnvelopeBuilder {
             });
         }
 
-        let origin_pubkey = signing_key.verifying_key().to_bytes();
-        let classical_envelope = EnvelopeBuilder::new(origin_pubkey, tx_xdr)
-            .ttl(ttl_hops)
-            .build(signing_key);
+        let origin_pubkey = signer.public_key();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let message_id = stellarconduit_core::message::envelope::compute_message_id(
+            &origin_pubkey,
+            &tx_xdr,
+            timestamp,
+        );
+        let signature = signer.sign(&message_id)?;
+
+        let classical_envelope = TransactionEnvelope {
+            message_id,
+            origin_pubkey,
+            tx_xdr,
+            ttl_hops,
+            timestamp,
+            signature,
+        };
 
         let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
             classical_envelope,
@@ -116,15 +132,31 @@ impl OfflineEnvelopeBuilder {
 pub fn resequence_and_resign(
     old_envelope: &TransactionEnvelope,
     new_sequence: i64,
-    signing_key: &SigningKey,
+    signer: &dyn KeySigner,
     policy: &crate::envelope::pq::SigningPolicy,
 ) -> Result<crate::envelope::pq::HybridSignedEnvelope, SyncEngineError> {
     let new_tx_xdr = with_updated_sequence(&old_envelope.tx_xdr, new_sequence)?;
 
-    let origin_pubkey = signing_key.verifying_key().to_bytes();
-    let classical_envelope = EnvelopeBuilder::new(origin_pubkey, new_tx_xdr)
-        .ttl(old_envelope.ttl_hops)
-        .build(signing_key);
+    let origin_pubkey = signer.public_key();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let message_id = stellarconduit_core::message::envelope::compute_message_id(
+        &origin_pubkey,
+        &new_tx_xdr,
+        timestamp,
+    );
+    let signature = signer.sign(&message_id)?;
+
+    let classical_envelope = TransactionEnvelope {
+        message_id,
+        origin_pubkey,
+        tx_xdr: new_tx_xdr,
+        ttl_hops: old_envelope.ttl_hops,
+        timestamp,
+        signature,
+    };
 
     let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
         classical_envelope,
@@ -279,16 +311,16 @@ impl PartiallySignedEnvelope {
 pub fn add_signature(
     partial: &mut PartiallySignedEnvelope,
     registry: &MultisigAccountRegistry,
-    signing_key: &SigningKey,
+    signer: &dyn KeySigner,
 ) -> Result<(), SyncEngineError> {
-    let pubkey = signing_key.verifying_key().to_bytes();
+    let pubkey = signer.public_key();
     if !registry.is_known_signer(&partial.source_account, &pubkey) {
         return Err(SyncEngineError::UnknownMultisigSigner {
             account: partial.source_account.clone(),
         });
     }
     let hash = multisig_payload_hash(&partial.source_account, partial.sequence, &partial.tx_xdr);
-    let signature = signing_key.sign(&hash).to_bytes();
+    let signature = signer.sign(&hash)?;
     partial.contributions.insert(pubkey, signature);
     Ok(())
 }
@@ -307,7 +339,7 @@ pub fn add_signature(
 pub fn try_promote(
     partial: &PartiallySignedEnvelope,
     registry: &MultisigAccountRegistry,
-    mesh_signing_key: &SigningKey,
+    mesh_signer: &dyn KeySigner,
     policy: &crate::envelope::pq::SigningPolicy,
     ttl_hops: u8,
 ) -> Result<crate::envelope::pq::HybridSignedEnvelope, SyncEngineError> {
@@ -318,10 +350,27 @@ pub fn try_promote(
             required_threshold: registry.threshold(&partial.source_account).unwrap_or(0),
         });
     }
-    let origin_pubkey = mesh_signing_key.verifying_key().to_bytes();
-    let classical_envelope = EnvelopeBuilder::new(origin_pubkey, partial.tx_xdr.clone())
-        .ttl(ttl_hops)
-        .build(mesh_signing_key);
+    let origin_pubkey = mesh_signer.public_key();
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tx_xdr = partial.tx_xdr.clone();
+    let message_id = stellarconduit_core::message::envelope::compute_message_id(
+        &origin_pubkey,
+        &tx_xdr,
+        timestamp,
+    );
+    let signature = mesh_signer.sign(&message_id)?;
+
+    let classical_envelope = TransactionEnvelope {
+        message_id,
+        origin_pubkey,
+        tx_xdr,
+        ttl_hops,
+        timestamp,
+        signature,
+    };
 
     let mut hybrid_envelope = crate::envelope::pq::HybridSignedEnvelope {
         classical_envelope,
@@ -370,11 +419,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let (hybrid_env, sequence) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -396,11 +446,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let (_, seq_a) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -409,7 +460,7 @@ mod tests {
         let (_, seq_b) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope_seq_next.b64"),
             10,
@@ -424,11 +475,12 @@ mod tests {
     fn test_build_without_seed_errors() {
         let mut sequences = SequenceReservationManager::new();
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
         // Correct account (matches the XDR), but never seeded.
         let result = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -446,11 +498,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(FEE_SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let result = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             FEE_SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -474,11 +527,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, 50);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let result = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             fixture("transaction_v1_envelope.b64"),
             10,
@@ -505,11 +559,12 @@ mod tests {
         let mut sequences = SequenceReservationManager::new();
         sequences.seed(SOURCE_G, SEQ - 1);
         let key = signing_key();
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
 
         let result = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             SOURCE_G,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             "not-valid-xdr !!!",
             10,
@@ -521,14 +576,18 @@ mod tests {
     fn test_resequence_updates_embedded_sequence() {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
-        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
             SEQ + 5,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
         )
         .unwrap();
@@ -542,14 +601,18 @@ mod tests {
     fn test_resequence_produces_new_message_id() {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
-        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
             SEQ + 5,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
         )
         .unwrap();
@@ -560,14 +623,18 @@ mod tests {
     fn test_resequence_preserves_other_transaction_fields() {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
-        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
             SEQ + 5,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
         )
         .unwrap();
@@ -582,14 +649,18 @@ mod tests {
     fn test_resequence_produces_validly_signed_envelope() {
         let old_xdr = fixture("transaction_v1_envelope.b64");
         let key = signing_key();
-        let old_env = EnvelopeBuilder::new(key.verifying_key().to_bytes(), old_xdr)
-            .ttl(10)
-            .build(&key);
+        let signer = crate::envelope::secure_signing::InMemorySigner::new(key.clone());
+        let old_env = stellarconduit_core::message::envelope::EnvelopeBuilder::new(
+            key.verifying_key().to_bytes(),
+            old_xdr,
+        )
+        .ttl(10)
+        .build(&key);
 
         let new_env = resequence_and_resign(
             &old_env,
             SEQ + 5,
-            &key,
+            &signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
         )
         .unwrap();
@@ -625,16 +696,18 @@ mod multisig_tests {
         let registry = registry_2_of_3(&signers);
         let mut partial = PartiallySignedEnvelope::new("GMULTISIG", 101, "tx_xdr");
 
-        add_signature(&mut partial, &registry, &signers[0]).unwrap();
+        let signer0 = crate::envelope::secure_signing::InMemorySigner::new(signers[0].clone());
+        add_signature(&mut partial, &registry, &signer0).unwrap();
 
         assert_eq!(partial.accumulated_weight(&registry), 1);
         assert!(!partial.meets_threshold(&registry));
 
         let mesh_key = signing_key();
+        let mesh_signer = crate::envelope::secure_signing::InMemorySigner::new(mesh_key.clone());
         let err = try_promote(
             &partial,
             &registry,
-            &mesh_key,
+            &mesh_signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             10,
         )
@@ -655,15 +728,18 @@ mod multisig_tests {
         let registry = registry_2_of_3(&signers);
         let mut partial = PartiallySignedEnvelope::new("GMULTISIG", 101, "tx_xdr");
 
-        add_signature(&mut partial, &registry, &signers[0]).unwrap();
-        add_signature(&mut partial, &registry, &signers[1]).unwrap();
+        let signer0 = crate::envelope::secure_signing::InMemorySigner::new(signers[0].clone());
+        let signer1 = crate::envelope::secure_signing::InMemorySigner::new(signers[1].clone());
+        add_signature(&mut partial, &registry, &signer0).unwrap();
+        add_signature(&mut partial, &registry, &signer1).unwrap();
         assert!(partial.meets_threshold(&registry));
 
         let mesh_key = signing_key();
+        let mesh_signer = crate::envelope::secure_signing::InMemorySigner::new(mesh_key.clone());
         let hybrid_env = try_promote(
             &partial,
             &registry,
-            &mesh_key,
+            &mesh_signer,
             &crate::envelope::pq::SigningPolicy::ClassicalOnly,
             10,
         )
@@ -696,9 +772,10 @@ mod multisig_tests {
         let registry = registry_2_of_3(&signers);
         let mut partial = PartiallySignedEnvelope::new("GMULTISIG", 101, "tx_xdr");
 
-        add_signature(&mut partial, &registry, &signers[0]).unwrap();
-        add_signature(&mut partial, &registry, &signers[0]).unwrap();
-        add_signature(&mut partial, &registry, &signers[0]).unwrap();
+        let signer0 = crate::envelope::secure_signing::InMemorySigner::new(signers[0].clone());
+        add_signature(&mut partial, &registry, &signer0).unwrap();
+        add_signature(&mut partial, &registry, &signer0).unwrap();
+        add_signature(&mut partial, &registry, &signer0).unwrap();
 
         assert_eq!(partial.contributor_count(), 1);
         assert_eq!(partial.accumulated_weight(&registry), 1);
@@ -712,7 +789,9 @@ mod multisig_tests {
         let mut partial = PartiallySignedEnvelope::new("GMULTISIG", 101, "tx_xdr");
 
         let outsider = signing_key();
-        let err = add_signature(&mut partial, &registry, &outsider)
+        let outsider_signer =
+            crate::envelope::secure_signing::InMemorySigner::new(outsider.clone());
+        let err = add_signature(&mut partial, &registry, &outsider_signer)
             .expect_err("a key outside the account's signer set must be rejected");
         assert!(matches!(err, SyncEngineError::UnknownMultisigSigner { .. }));
 

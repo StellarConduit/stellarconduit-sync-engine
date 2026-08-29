@@ -59,6 +59,7 @@ async fn main() {
     let clock = std::sync::Arc::new(stellarconduit_sync_engine::clock::HybridClock::new());
     let mut queue = OutboundTxQueue::new(clock);
     let signing_key = SigningKey::generate(&mut OsRng);
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key.clone());
     let source_account = "GDEMO";
 
     sequences.seed(source_account, 1_000_000);
@@ -74,7 +75,7 @@ async fn main() {
         let (hybrid, seq) = OfflineEnvelopeBuilder::build_and_sign(
             &mut sequences,
             source_account,
-            &signing_key,
+            &signer,
             &SigningPolicy::ClassicalOnly,
             format!("mock_tx_xdr_{}", i),
             10,
@@ -157,6 +158,8 @@ async fn main() {
         let mut seq_b = SequenceReservationManager::new();
         let key_a = SigningKey::generate(&mut OsRng);
         let key_b = SigningKey::generate(&mut OsRng);
+        let signer_a = stellarconduit_sync_engine::envelope::InMemorySigner::new(key_a.clone());
+        let signer_b = stellarconduit_sync_engine::envelope::InMemorySigner::new(key_b.clone());
         let shared = "GSHARED";
 
         seq_a.seed(shared, 500);
@@ -165,7 +168,7 @@ async fn main() {
         let (hybrid_a, s_a) = OfflineEnvelopeBuilder::build_and_sign(
             &mut seq_a,
             shared,
-            &key_a,
+            &signer_a,
             &SigningPolicy::ClassicalOnly,
             "conflict_xdr_a",
             10,
@@ -176,7 +179,7 @@ async fn main() {
         let (hybrid_b, s_b) = OfflineEnvelopeBuilder::build_and_sign(
             &mut seq_b,
             shared,
-            &key_b,
+            &signer_b,
             &SigningPolicy::ClassicalOnly,
             "conflict_xdr_b",
             10,

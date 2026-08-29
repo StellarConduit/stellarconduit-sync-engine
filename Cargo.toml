@@ -134,6 +134,19 @@ serde_json = "1.0"
 # anything that must be deterministic between prover and verifier).
 num-bigint = { version = "0.4", features = ["rand"] }
 
+# Pure-Rust DEFLATE for at-rest envelope compression (issue #56) and its
+# compression-oracle side-channel mitigation (issue #93,
+# `src/storage/envelope_compression.rs`). Chosen over `zstd`/`lz4`: those add a
+# C toolchain dependency (or a large pure-Rust port) that the mobile-wallet
+# size constraint this manifest repeatedly cites cannot absorb, and DEFLATE's
+# LZ77 + Huffman is the *canonical* compression-oracle target — running the
+# CRIME/BREACH-style measurement harness against it keeps our numbers directly
+# comparable to the published literature. `miniz_oxide` is what `flate2`'s
+# default backend already is, is `no_std`-friendly, and adds no new transitive
+# crates of note. Default features (`with-alloc`) give the `compress_to_vec` /
+# `decompress_to_vec_with_limit` one-shot helpers this crate uses.
+miniz_oxide = "0.8"
+
 [dev-dependencies]
 tokio-test = "0.4"
 mockall = "0.12"
@@ -168,6 +181,18 @@ path = "tests/integration/cli_test.rs"
 [[test]]
 name = "vrf_tiebreak_test"
 path = "tests/integration/vrf_tiebreak_test.rs"
+
+[[test]]
+name = "proof_compression_test"
+path = "tests/integration/proof_compression_test.rs"
+
+[[test]]
+name = "reputation_test"
+path = "tests/integration/reputation_test.rs"
+
+[[test]]
+name = "compression_oracle_test"
+path = "tests/integration/compression_oracle_test.rs"
 
 [[test]]
 name = "adversarial_agents_test"

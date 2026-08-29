@@ -88,6 +88,7 @@ async fn test_open_empty_db_is_empty() {
 async fn test_queue_payment_survives_restart() {
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::QUEUED_ACCOUNT;
 
     // Queue one payment, then drop the engine (simulated crash) immediately.
@@ -96,7 +97,7 @@ async fn test_queue_payment_survives_restart() {
         engine
             .queue_payment(
                 account,
-                &key,
+                &signer,
                 fixtures::QUEUED_SEQ_1,
                 TxPriority::Emergency,
                 10,
@@ -128,6 +129,7 @@ async fn test_queue_payment_survives_restart() {
 async fn test_sequence_reservations_survive_restart() {
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::SEQ_ACCOUNT;
 
     // Queue several payments from the same account in one session.
@@ -139,7 +141,7 @@ async fn test_sequence_reservations_survive_restart() {
             fixtures::SEQ_SEQ_3,
         ] {
             engine
-                .queue_payment(account, &key, tx_xdr, TxPriority::Normal, 10)
+                .queue_payment(account, &signer, tx_xdr, TxPriority::Normal, 10)
                 .await
                 .unwrap();
         }
@@ -159,7 +161,13 @@ async fn test_sequence_reservations_survive_restart() {
     );
 
     engine
-        .queue_payment(account, &key, fixtures::SEQ_SEQ_4, TxPriority::Normal, 10)
+        .queue_payment(
+            account,
+            &signer,
+            fixtures::SEQ_SEQ_4,
+            TxPriority::Normal,
+            10,
+        )
         .await
         .unwrap();
 
@@ -177,6 +185,7 @@ async fn test_no_sequence_reuse_after_restart() {
     // update, reopening must not let a later queue_payment reuse that sequence.
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::REUSE_ACCOUNT;
 
     // First session: queue one payment. Because the reservation + envelope +
@@ -185,7 +194,13 @@ async fn test_no_sequence_reuse_after_restart() {
     {
         let mut engine = SyncEngine::open(&path).await.unwrap();
         engine
-            .queue_payment(account, &key, fixtures::REUSE_SEQ_1, TxPriority::Normal, 10)
+            .queue_payment(
+                account,
+                &signer,
+                fixtures::REUSE_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
             .await
             .unwrap();
         // Dropping here models the process being killed right after the
@@ -201,7 +216,13 @@ async fn test_no_sequence_reuse_after_restart() {
         "the reservation was durably persisted despite the simulated crash"
     );
     engine
-        .queue_payment(account, &key, fixtures::REUSE_SEQ_2, TxPriority::Normal, 10)
+        .queue_payment(
+            account,
+            &signer,
+            fixtures::REUSE_SEQ_2,
+            TxPriority::Normal,
+            10,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -215,12 +236,19 @@ async fn test_no_sequence_reuse_after_restart() {
 async fn test_no_double_dispatch_after_restart_post_dispatch() {
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::DISP_ACCOUNT;
 
     let envelope = {
         let mut engine = SyncEngine::open(&path).await.unwrap();
         engine
-            .queue_payment(account, &key, fixtures::DISP_SEQ_1, TxPriority::Normal, 10)
+            .queue_payment(
+                account,
+                &signer,
+                fixtures::DISP_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
             .await
             .unwrap()
     };
@@ -251,13 +279,14 @@ async fn test_no_double_dispatch_after_restart_post_dispatch() {
 async fn test_mark_settlement_rejects_illegal_transition() {
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::SETTLE_ACCOUNT;
 
     let mut engine = SyncEngine::open(&path).await.unwrap();
     let envelope = engine
         .queue_payment(
             account,
-            &key,
+            &signer,
             fixtures::SETTLE_SEQ_1,
             TxPriority::Normal,
             10,
@@ -290,6 +319,7 @@ async fn test_mark_settlement_rejects_illegal_transition() {
 async fn test_mark_settlement_persists_across_restart() {
     let (_dir, path) = temp_db_path();
     let key = signing_key();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(key.clone());
     let account = fixtures::PERSIST_ACCOUNT;
 
     // Carry an envelope all the way to Settled, then drop the engine.
@@ -298,7 +328,7 @@ async fn test_mark_settlement_persists_across_restart() {
         let envelope = engine
             .queue_payment(
                 account,
-                &key,
+                &signer,
                 fixtures::PERSIST_SEQ_1,
                 TxPriority::Normal,
                 10,
