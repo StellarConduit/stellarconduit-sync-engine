@@ -15,6 +15,12 @@ license = "Apache-2.0"
 # which needs `cdylib` for the same reason (its own `src/ffi.rs`).
 crate-type = ["cdylib", "staticlib", "rlib"]
 
+[features]
+# Gates the loom-based concurrency model-checker tests in
+# src/queue/priority.rs and src/queue/sequence.rs.
+# Run them with:  cargo test --features loom loom_test_
+loom = []
+
 [dependencies]
 # Shared mesh envelope types, signing, and relay-chain proofs
 stellarconduit-core = { git = "https://github.com/StellarConduit/stellarconduit-core.git", rev = "da4c057" }
@@ -138,6 +144,17 @@ num-bigint = { version = "0.4", features = ["rand"] }
 tokio-test = "0.4"
 mockall = "0.12"
 tempfile = "3.27"
+
+# loom: exhaustive concurrency model checker for the single-owner contract
+# proofs in src/queue/priority.rs and src/queue/sequence.rs.
+# Version 0.7 is the latest stable release that supports the std::sync
+# primitive shims (Mutex, Arc) we use in the loom test scaffolding.
+# Declared as a non-optional dev-dependency (Cargo does not allow optional
+# dev-dependencies); the feature flag `loom` gates whether the loom test
+# modules are compiled in, not whether loom itself is present.
+loom = { version = "0.7", features = ["futures"] }
+
+clap = { version = "4.5", features = ["derive"] }
 
 # Property-based testing for conflict detection and the settlement state
 # machine. Chosen over quickcheck: proptest ships built-in shrinking (failures

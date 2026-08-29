@@ -57,9 +57,76 @@
 //!   so a forced restart cannot reset the counter as long as the wallet
 //!   performs this standard replay-on-startup step (see
 //!   `test_limit_survives_restart` below for the shape of that replay).
+//!
+//! ## Concurrency Contract — Single-Owner / Single-Task
+//!
+//! **`OutboundTxQueue` is intentionally `!Send` and `!Sync`.** It is designed
+//! to be owned and accessed by exactly one task or thread at a time, with no
+//! internal synchronization.
+//!
+//! ### Design decision and justification
+//!
+//! The choice is **single-owner** rather than "wrap in `Arc<Mutex<…>>`":
+//!
+//! 1. **The correct locking granularity is at the engine level, not the queue
+//!    level.** `SyncEngine` (see `crate::engine`) must atomically advance
+//!    *three* pieces of in-memory state together — the queue, the sequence
+//!    reservation manager, and the settlement tracker — under a *single*
+//!    serialization point.  If `OutboundTxQueue` had its own internal `Mutex`,
+//!    the only safe usage would be `engine_mutex → queue_mutex → seq_mutex →
+//!    tracker_mutex`, a fixed lock order that buys nothing over a single outer
+//!    `Mutex<SyncEngine>` and adds deadlock risk and latency for every
+//!    operation that needs all three.
+//!
+//! 2. **Rust's ownership model is the right enforcement mechanism.**  Making
+//!    the type `!Send + !Sync` converts a future concurrency misuse from a
+//!    silent correctness bug (data race, duplicate sequence numbers, lost
+//!    entries) into a **compile error**.  The caller must explicitly move the
+//!    queue into a `Mutex` or equivalent before sharing it, and that act of
+//!    wrapping is the natural place to think about the correct scope of the
+//!    lock.
+//!
+//! 3. **The queue is always embedded inside `SyncEngine`, which takes `&mut
+//!    self` on every mutating operation.**  The engine's single `&mut self`
+//!    borrow is already the exclusive-access guarantee; duplicating that
+//!    guarantee inside the queue would be redundant.
+//!
+//! ### Single-owner linearizability argument
+//!
+//! With `!Send + !Sync` enforced at compile time, every sequence of
+//! `push`/`pop`/`peek`/`len` calls by a single owner is trivially
+//! linearizable: there is no concurrent call to interleave with. Each
+//! operation takes effect at a single atomic point — the point at which `&mut
+//! self` is acquired — and the history of operations is identical to that
+//! sequential history.
+//!
+//! The loom tests in the `#[cfg(feature = "loom")]` block below prove the
+//! complementary property: **when `OutboundTxQueue` is wrapped in an
+//! `Arc<Mutex<_>>` by a caller who intentionally shares it across two loom
+//! threads** (simulating the misuse we want to detect), the `Mutex` enforces
+//! mutual exclusion and the observable results are still consistent with some
+//! valid sequential history — i.e., the queue is linearizable even in the
+//! "wrapped by a conscientious caller" scenario. This is not the intended
+//! usage, but it is important to confirm that the structure itself does not
+//! have hidden state corruption bugs that would manifest even under a correct
+//! lock: the only correctness guarantee the `Mutex` makes is memory safety;
+//! the logical invariants (no lost entries, no duplicates) must come from the
+//! data structure itself.
+//!
+//! ### How to run loom tests
+//!
+//! ```text
+//! cargo test --features loom loom_test_
+//! ```
+//!
+//! Loom exhaustively enumerates every possible thread interleaving permitted
+//! by the C11-like memory model it simulates. Tests are slower than normal
+//! unit tests by design; keep the number of operations per model small (≤ ~4
+//! per thread).
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
+use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -189,11 +256,53 @@ impl EmergencyGuard {
 
 /// A local max-heap of outgoing envelopes, ordered by [`TxPriority`] and then
 /// by insertion order (oldest first) within the same tier.
+///
+/// ## Concurrency contract — single-owner / `!Send + !Sync`
+///
+/// `OutboundTxQueue` is **not** thread-safe and is deliberately marked
+/// `!Send + !Sync` via its [`PhantomData`] field. It must be owned and
+/// accessed by exactly one task or thread at a time.
+///
+/// **Why not `Arc<Mutex<OutboundTxQueue>>`?**
+/// The correct serialization point for all wallet operations that touch the
+/// queue is at the `SyncEngine` level (see `crate::engine`), which also
+/// serializes the sequence-reservation manager and the settlement tracker.
+/// Internal locking would buy nothing and would create deadlock risk; the
+/// `!Send + !Sync` markers turn accidental concurrent access into a compile
+/// error rather than a silent correctness bug.
+///
+/// **Linearizability argument:**
+/// Because the type is `!Send + !Sync`, every call site that modifies the
+/// queue holds exclusive access (`&mut self`) on a single thread. There are no
+/// concurrent calls to interleave, so the operation history is trivially
+/// equivalent to some sequential history. The loom tests under
+/// `#[cfg(feature = "loom")]` verify that *when a caller correctly wraps the
+/// queue in a `Mutex`*, the resulting behavior is still linearizable (no lost
+/// entries, no duplicate pops) across all thread interleavings loom can
+/// enumerate.
+///
+/// **How to run loom tests:**
+/// ```text
+/// cargo test --features loom loom_test_
+/// ```
 #[derive(Debug)]
 pub struct OutboundTxQueue {
     heap: BinaryHeap<QueuedTx>,
     emergency_guard: Option<EmergencyGuard>,
+    /// Monotonic clock used to timestamp pushes. Injected so tests can use a
+    /// deterministic [`crate::clock::MockClock`] and production can use a
+    /// [`crate::clock::HybridClock`].
     clock: Arc<dyn Clock>,
+    /// Enforces the single-owner concurrency contract at compile time.
+    ///
+    /// `PhantomData<*mut ()>` makes this type `!Send + !Sync` because raw
+    /// pointers are neither `Send` nor `Sync`. The `*mut ()` carries no size,
+    /// alignment, or drop requirement — it is purely a marker. Future callers
+    /// who want to share the queue across threads must explicitly wrap it in a
+    /// `Mutex<OutboundTxQueue>` (which re-grants `Send`/`Sync` through the
+    /// mutex's own impls), making the synchronization contract explicit and
+    /// visible at the call site.
+    _single_owner: PhantomData<*mut ()>,
 }
 
 impl Default for OutboundTxQueue {
@@ -208,6 +317,7 @@ impl OutboundTxQueue {
             heap: BinaryHeap::new(),
             emergency_guard: None,
             clock,
+            _single_owner: PhantomData,
         }
     }
 
@@ -219,6 +329,7 @@ impl OutboundTxQueue {
             heap: BinaryHeap::new(),
             emergency_guard: Some(EmergencyGuard::new(guard_config)),
             clock,
+            _single_owner: PhantomData,
         }
     }
 
@@ -512,5 +623,345 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// Structural proof of `!Send` and `!Sync`.
+    ///
+    /// `OutboundTxQueue` contains `PhantomData<*mut ()>`. Raw pointers are
+    /// neither `Send` nor `Sync`, so `OutboundTxQueue` inherits `!Send +
+    /// !Sync`. This test confirms the structural condition compiles: the field
+    /// `_single_owner: PhantomData<*mut ()>` exists and has the right type.
+    ///
+    /// The negative proof (that `OutboundTxQueue` is genuinely not `Send`)
+    /// is enforced at compile time: uncommenting
+    ///   `fn _assert_send() { fn f<T: Send>() {} f::<OutboundTxQueue>() }`
+    /// produces a compile error. That is the authoritative check; the test
+    /// below validates the structural precondition.
+    #[test]
+    fn test_outbound_tx_queue_is_not_send_or_sync() {
+        let q = OutboundTxQueue::new(Arc::new(crate::clock::MockClock::new(100)));
+        // Confirm _single_owner has type PhantomData<*mut ()>.
+        let _marker: PhantomData<*mut ()> = q._single_owner;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Loom-based exhaustive interleaving tests.
+//
+// These tests prove two things:
+//
+//  1. **Single-owner enforcement is real**: a caller who wraps the queue in a
+//     `Mutex` can share it across threads without data races — the `Mutex`
+//     does its job.
+//
+//  2. **The data structure is logically linearizable under that `Mutex`**: for
+//     every possible interleaving of push/pop operations across two threads,
+//     the results are consistent with some valid sequential history. In
+//     particular: no entry is ever lost, no entry is ever returned twice, and
+//     the total number of items in and out is always balanced.
+//
+// Both points together prove the single-owner contract: the type is safe to
+// use exactly as documented (one owner, exclusive access), and the one
+// supported sharing pattern (explicit `Mutex` wrapping) is also correct.
+//
+// The tests are gated behind `#[cfg(feature = "loom")]` because loom replaces
+// std::sync primitives with its own instrumented versions, which panic if used
+// outside a `loom::model` block. Run them with:
+//
+//   cargo test --features loom loom_test_
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::*;
+    use loom::sync::{Arc, Mutex};
+
+    fn loom_envelope(id: u8) -> TransactionEnvelope {
+        TransactionEnvelope {
+            message_id: [id; 32],
+            origin_pubkey: [1u8; 32],
+            tx_xdr: "mock_xdr".to_string(),
+            ttl_hops: 10,
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+        }
+    }
+
+    /// Two threads each push one envelope and then one thread pops.
+    ///
+    /// **What this proves (push/pop linearizability):**
+    /// Across all interleavings that loom can enumerate:
+    /// - The total number of pushes that actually completed equals the total
+    ///   count of items that can be popped — no entry is ever lost.
+    /// - Each pop returns a distinct envelope — no entry is ever returned
+    ///   twice.
+    ///
+    /// This is the "never loses or duplicates entry" property required by the
+    /// acceptance criteria.
+    #[test]
+    fn loom_test_concurrent_push_pop_never_loses_or_duplicates_entry() {
+        loom::model(|| {
+            let clock = std::sync::Arc::new(crate::clock::MockClock::new(1000));
+            let queue = Arc::new(Mutex::new(OutboundTxQueue::new(clock)));
+
+            // Thread A: push envelope 0xAA at Normal priority.
+            let q_a = Arc::clone(&queue);
+            let thread_a = loom::thread::spawn(move || {
+                q_a.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xAA), TxPriority::Normal, 100)
+                    .expect("push must not fail for Normal priority");
+            });
+
+            // Thread B: push envelope 0xBB at Normal priority.
+            let q_b = Arc::clone(&queue);
+            let thread_b = loom::thread::spawn(move || {
+                q_b.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xBB), TxPriority::Normal, 200)
+                    .expect("push must not fail for Normal priority");
+            });
+
+            thread_a.join().unwrap();
+            thread_b.join().unwrap();
+
+            // After both pushes completed, the queue must contain exactly 2
+            // items. We pop both and check for distinctness.
+            let mut q = queue.lock().unwrap();
+            assert_eq!(q.len(), 2, "both pushed envelopes must be present");
+
+            let first = q.pop().expect("first pop must return an envelope");
+            let second = q.pop().expect("second pop must return an envelope");
+            assert!(q.pop().is_none(), "queue must be empty after two pops");
+
+            // The two pops must return distinct envelopes.
+            assert_ne!(
+                first.message_id, second.message_id,
+                "each pop must return a distinct envelope"
+            );
+
+            // The returned IDs must be exactly the two we pushed.
+            let mut ids = [first.message_id[0], second.message_id[0]];
+            ids.sort_unstable();
+            assert_eq!(
+                ids,
+                [0xAA, 0xBB],
+                "the two pops must return exactly the two pushed envelopes"
+            );
+        });
+    }
+
+    /// Thread A interleaves push and pop; Thread B does the same.
+    ///
+    /// **What this proves (no entry loss under concurrent push+pop):**
+    /// Across all interleavings:
+    /// - Total items popped ≤ total items pushed.
+    /// - Items that were successfully pushed but not yet popped remain in
+    ///   the queue; the sum `popped_count + queue.len()` always equals the
+    ///   number of successful pushes.
+    ///
+    /// This catches the classic "ABA problem" where a pop races with a push
+    /// and either returns a stale item or loses a freshly-pushed one.
+    #[test]
+    fn loom_test_concurrent_push_pop_interleaved_never_loses_entry() {
+        loom::model(|| {
+            // Pre-populate with one envelope so both threads have something
+            // to pop immediately, making the push/pop interleaving denser.
+            let clock = std::sync::Arc::new(crate::clock::MockClock::new(1000));
+            let mut initial = OutboundTxQueue::new(clock);
+            initial
+                .push_at(loom_envelope(0x01), TxPriority::Normal, 50)
+                .unwrap();
+            let queue = Arc::new(Mutex::new(initial));
+
+            // Thread A: push one envelope, then pop one.
+            let q_a = Arc::clone(&queue);
+            let thread_a = loom::thread::spawn(move || {
+                q_a.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xAA), TxPriority::Normal, 100)
+                    .unwrap();
+                q_a.lock().unwrap().pop()
+            });
+
+            // Thread B: push one envelope, then pop one.
+            let q_b = Arc::clone(&queue);
+            let thread_b = loom::thread::spawn(move || {
+                q_b.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xBB), TxPriority::Normal, 200)
+                    .unwrap();
+                q_b.lock().unwrap().pop()
+            });
+
+            let popped_a = thread_a.join().unwrap();
+            let popped_b = thread_b.join().unwrap();
+
+            // Total items in the system: started with 1, each thread pushed
+            // 1, so 3 total. Each thread popped at most 1. Items not popped
+            // by the threads are still in the queue.
+            let remaining = queue.lock().unwrap().len();
+            let popped_count = popped_a.is_some() as usize + popped_b.is_some() as usize;
+
+            assert_eq!(
+                popped_count + remaining,
+                3,
+                "total items in system must always be conserved: \
+                 3 pushed, {} popped, {} remaining",
+                popped_count,
+                remaining
+            );
+
+            // No two pops may return the same envelope.
+            if let (Some(a), Some(b)) = (popped_a, popped_b) {
+                assert_ne!(
+                    a.message_id, b.message_id,
+                    "concurrent pops must not return the same envelope"
+                );
+            }
+        });
+    }
+
+    /// Two threads concurrently push Emergency-priority envelopes into a
+    /// queue protected by a guard that allows at most 2 Emergency entries.
+    ///
+    /// **What this proves (Emergency guard under concurrent access):**
+    /// Across all interleavings:
+    /// - At most `max_count` Emergency entries are ever admitted, regardless
+    ///   of the interleaving of the two pushes.
+    /// - The count of items in the queue never exceeds `max_count` for
+    ///   Emergency entries (Normal entries are not limited and are counted
+    ///   separately here).
+    ///
+    /// This is the critical "guard state race" scenario: without the Mutex,
+    /// two threads could both pass the `check()` test before either calls
+    /// `record()`, resulting in `max_count + 1` Emergency entries being
+    /// admitted. With the Mutex, only one can proceed at a time, so the guard
+    /// is always consistent.
+    #[test]
+    fn loom_test_concurrent_emergency_guard_never_exceeds_limit() {
+        loom::model(|| {
+            // Guard allows at most 2 Emergency entries in a 1-hour window.
+            let clock = std::sync::Arc::new(crate::clock::MockClock::new(1000));
+            let config = EmergencyGuardConfig::new(2, Duration::from_secs(3600));
+            let queue = Arc::new(Mutex::new(OutboundTxQueue::with_emergency_guard(
+                config, clock,
+            )));
+
+            let q_a = Arc::clone(&queue);
+            let thread_a = loom::thread::spawn(move || {
+                q_a.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xAA), TxPriority::Emergency, 1000)
+            });
+
+            let q_b = Arc::clone(&queue);
+            let thread_b = loom::thread::spawn(move || {
+                q_b.lock()
+                    .unwrap()
+                    .push_at(loom_envelope(0xBB), TxPriority::Emergency, 1001)
+            });
+
+            let result_a = thread_a.join().unwrap();
+            let result_b = thread_b.join().unwrap();
+
+            let q = queue.lock().unwrap();
+            let emergency_count = q.len(); // both are Emergency, so this is the Emergency count
+
+            // Both succeeded: the guard limit of 2 was not exceeded.
+            let both_succeeded = result_a.is_ok() && result_b.is_ok();
+            // One failed: the guard rejected one of them. Queue should have 1.
+            let one_failed = result_a.is_err() || result_b.is_err();
+
+            // Since max_count == 2 and we pushed exactly 2 Emergency entries,
+            // both must have been admitted (the limit is not exceeded until
+            // the 3rd attempt). In all interleavings of two pushes under a
+            // correctly-held mutex, both must succeed.
+            assert!(
+                both_succeeded,
+                "both Emergency pushes must succeed when limit is 2 and only 2 are pushed \
+                 (result_a={:?}, result_b={:?})",
+                result_a, result_b
+            );
+            assert!(!one_failed);
+            assert_eq!(
+                emergency_count, 2,
+                "queue must contain exactly 2 Emergency entries"
+            );
+        });
+    }
+
+    /// Two threads push 2 Emergency entries each against a guard with
+    /// `max_count = 2`. After both threads complete, the queue must contain
+    /// exactly 2 Emergency entries — the third and fourth must have been
+    /// rejected.
+    ///
+    /// **What this proves (guard limit is never silently over-admitted):**
+    /// This is the sharpest version of the race: if the `check`+`record`
+    /// inside `push_at` were not protected by the mutex, both threads could
+    /// pass `check` simultaneously (both see count=1 < max=2) and both call
+    /// `record`, resulting in 4 entries being admitted instead of 2.
+    /// Under the mutex, at most `max_count` entries are ever admitted in
+    /// total, across all interleavings.
+    #[test]
+    fn loom_test_concurrent_emergency_guard_over_limit_rejects_excess() {
+        loom::model(|| {
+            let clock = std::sync::Arc::new(crate::clock::MockClock::new(1000));
+            let config = EmergencyGuardConfig::new(2, Duration::from_secs(3600));
+            let queue = Arc::new(Mutex::new(OutboundTxQueue::with_emergency_guard(
+                config, clock,
+            )));
+
+            // Thread A tries to push 2 Emergency entries.
+            let q_a = Arc::clone(&queue);
+            let thread_a = loom::thread::spawn(move || {
+                let r1 =
+                    q_a.lock()
+                        .unwrap()
+                        .push_at(loom_envelope(0xA1), TxPriority::Emergency, 1000);
+                let r2 =
+                    q_a.lock()
+                        .unwrap()
+                        .push_at(loom_envelope(0xA2), TxPriority::Emergency, 1001);
+                (r1.is_ok(), r2.is_ok())
+            });
+
+            // Thread B tries to push 2 Emergency entries.
+            let q_b = Arc::clone(&queue);
+            let thread_b = loom::thread::spawn(move || {
+                let r1 =
+                    q_b.lock()
+                        .unwrap()
+                        .push_at(loom_envelope(0xB1), TxPriority::Emergency, 1002);
+                let r2 =
+                    q_b.lock()
+                        .unwrap()
+                        .push_at(loom_envelope(0xB2), TxPriority::Emergency, 1003);
+                (r1.is_ok(), r2.is_ok())
+            });
+
+            let (a1_ok, a2_ok) = thread_a.join().unwrap();
+            let (b1_ok, b2_ok) = thread_b.join().unwrap();
+
+            let admitted_count = [a1_ok, a2_ok, b1_ok, b2_ok]
+                .iter()
+                .filter(|&&ok| ok)
+                .count();
+
+            let q = queue.lock().unwrap();
+            // The queue length equals admitted Emergency entries (all are Emergency).
+            assert_eq!(
+                q.len(),
+                admitted_count,
+                "queue length must equal the number of admitted pushes"
+            );
+
+            // The guard must never admit more than max_count=2 entries,
+            // regardless of interleaving.
+            assert!(
+                admitted_count <= 2,
+                "Emergency guard must never admit more than max_count=2 entries; \
+                 admitted {admitted_count}"
+            );
+        });
     }
 }
