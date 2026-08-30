@@ -38,6 +38,48 @@
 //! - Slightly more complex code
 //!
 //! For a detailed threat model analysis, see `src/encryption.rs`.
+//!
+//! # Required SQLite Configuration for Crash Safety (issue #95)
+//!
+//! [`SyncEngineDb::enqueue_transaction`] and [`SyncEngineDb::set_settlement_status`]
+//! rely on SQLite's own transactional atomicity for crash safety, but that
+//! guarantee is only as strong as the connection's actual, in-effect
+//! `journal_mode` and `synchronous` settings — both of which SQLite can
+//! silently leave at a weaker value than requested (e.g. `PRAGMA
+//! journal_mode=WAL` is silently ignored, not an error, on a filesystem or
+//! VFS backend without shared-memory support) rather than erroring.
+//! Assuming a pragma "worked" because setting it didn't return an error is
+//! exactly the unverified assumption issue #95 exists to close.
+//!
+//! This crate requires, and [`SyncEngineDb::init`] both sets **and reads
+//! back to confirm**:
+//!
+//! - **`journal_mode = WAL`** — SQLite's own recommended mode for mobile
+//!   deployments (this crate's actual target — see the crate-level docs):
+//!   writers never block readers, and a WAL frame's chained checksum makes
+//!   a torn/truncated tail from a power loss unambiguously detectable and
+//!   safely ignorable on the next open, rather than merely "usually fine."
+//! - **`synchronous = FULL`** — required regardless of journal mode.
+//!   `synchronous = NORMAL` is safe against *corruption* in WAL mode but
+//!   explicitly **not** safe against *losing the most recent commit*: the
+//!   WAL file itself is only fsynced at checkpoints under NORMAL, so a
+//!   transaction this crate already returned `Ok` for could vanish on power
+//!   loss. For a payment queue, "the call returned success" must imply
+//!   durability, not merely internal consistency — see
+//!   `docs/CRASH_CONSISTENCY_FINDINGS.md` for how this was verified
+//!   empirically with a fault-injecting write-tracing harness
+//!   (`crate::storage::fault_vfs`, test-only) rather than assumed.
+//!
+//! [`SyncEngineDb::init`] applies both pragmas and then **fails loudly**
+//! (returns [`SyncEngineError::UnsafeSqliteConfiguration`]) if reading them
+//! back doesn't confirm the required value, for every on-disk database
+//! (`:memory:` databases skip this: they cannot use WAL at all, and have no
+//! crash to survive). [`crate::engine::SyncEngine`]'s second, synchronous
+//! `dispatch_conn` onto the same file enforces the identical policy via the
+//! same [`apply_crash_safety_pragmas`]/[`read_crash_safety_pragmas`]/
+//! [`check_crash_safety`] functions, so both of this crate's connections to
+//! a database agree on what "safe" means rather than one of them silently
+//! trusting the other.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -70,6 +112,57 @@ const ENCRYPTION_METADATA_TABLE: &str = "encryption_metadata";
 
 /// Metadata key for encryption flag
 const ENCRYPTION_ENABLED_KEY: &str = "encryption_enabled";
+
+/// The `journal_mode` this crate requires for its crash-safety guarantees —
+/// see the "Required SQLite Configuration for Crash Safety" module docs
+/// above. Compared case-insensitively against `PRAGMA journal_mode`'s
+/// result, which SQLite always reports in lowercase.
+const REQUIRED_JOURNAL_MODE: &str = "wal";
+
+/// The `synchronous` level this crate requires. SQLite's `PRAGMA
+/// synchronous` getter returns an integer, not the symbolic name:
+/// `0 = OFF`, `1 = NORMAL`, `2 = FULL`, `3 = EXTRA`.
+const REQUIRED_SYNCHRONOUS: i64 = 2; // FULL
+
+/// Set this crate's required crash-safety pragmas on `conn`. Callers must
+/// follow this with [`read_crash_safety_pragmas`] + [`check_crash_safety`]
+/// rather than assuming it took effect — see the module docs.
+pub(crate) fn apply_crash_safety_pragmas(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;")
+}
+
+/// Read back the connection's actual, in-effect `journal_mode` and
+/// `synchronous` settings.
+pub(crate) fn read_crash_safety_pragmas(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<(String, i64)> {
+    let journal_mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    let synchronous: i64 = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
+    Ok((journal_mode, synchronous))
+}
+
+/// The single source of truth for whether a database's actual
+/// `journal_mode`/`synchronous` configuration satisfies this crate's
+/// crash-safety requirements. Shared by [`SyncEngineDb::init`] (async) and
+/// `crate::engine::open_dispatch_connection` (sync) so both of this crate's
+/// connections to the same database file enforce an identical policy.
+pub(crate) fn check_crash_safety(
+    journal_mode: &str,
+    synchronous: i64,
+) -> Result<(), SyncEngineError> {
+    if journal_mode.eq_ignore_ascii_case(REQUIRED_JOURNAL_MODE)
+        && synchronous == REQUIRED_SYNCHRONOUS
+    {
+        Ok(())
+    } else {
+        Err(SyncEngineError::UnsafeSqliteConfiguration {
+            journal_mode: journal_mode.to_string(),
+            required_journal_mode: REQUIRED_JOURNAL_MODE.to_string(),
+            synchronous,
+            required_synchronous: REQUIRED_SYNCHRONOUS,
+        })
+    }
+}
 
 pub struct SyncEngineDb {
     conn: Connection,
@@ -260,6 +353,20 @@ impl SyncEngineDb {
         } else {
             Connection::open(Path::new(db_path)).await?
         };
+
+        // `:memory:` databases cannot use WAL (SQLite silently keeps them on
+        // "memory" journal mode) and have no crash to survive, so the
+        // crash-safety policy below only applies to on-disk databases. See
+        // the "Required SQLite Configuration for Crash Safety" module docs.
+        if db_path != ":memory:" {
+            let (journal_mode, synchronous) = conn
+                .call(|conn| {
+                    apply_crash_safety_pragmas(conn)?;
+                    Ok(read_crash_safety_pragmas(conn)?)
+                })
+                .await?;
+            check_crash_safety(&journal_mode, synchronous)?;
+        }
 
         conn.call(|conn| {
             conn.execute_batch(
@@ -705,6 +812,16 @@ impl SyncEngineDb {
         Ok(())
     }
 
+    /// Atomically advance `message_id`'s settlement status and append the
+    /// matching `settlement_history` audit row in a single SQLite
+    /// transaction (issue #95). Without the explicit transaction here, the
+    /// status upsert and the history insert are two independently-committed
+    /// autocommit statements: a crash between them leaves
+    /// `settlement_status` already showing the new status while
+    /// `settlement_history` is missing the entry that explains how it got
+    /// there — a real, silent inconsistency the crash-consistency sweep in
+    /// `crate::storage::db::crash_consistency_tests` found. See
+    /// `docs/CRASH_CONSISTENCY_FINDINGS.md`.
     pub async fn set_settlement_status(
         &self,
         message_id: [u8; 32],
@@ -715,7 +832,9 @@ impl SyncEngineDb {
         let status_str = status.as_str().to_string();
         self.conn
             .call(move |conn| {
-                let from_status: String = conn
+                let tx = conn.transaction()?;
+
+                let from_status: String = tx
                     .query_row(
                         "SELECT status FROM settlement_status WHERE message_id = ?1",
                         rusqlite::params![id],
@@ -723,18 +842,19 @@ impl SyncEngineDb {
                     )
                     .unwrap_or_default();
 
-                conn.execute(
+                tx.execute(
                     "INSERT OR REPLACE INTO settlement_status (message_id, status, updated_at)
                      VALUES (?1, ?2, ?3)",
                     rusqlite::params![id, status_str, updated_at as i64],
                 )?;
 
-                conn.execute(
+                tx.execute(
                     "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
                      VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![id, from_status, status_str, updated_at as i64],
                 )?;
 
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -1612,7 +1732,35 @@ impl SyncEngineDb {
             ImportOutcome::TargetNotEmpty => Err(SyncEngineError::ImportTargetNotEmpty),
         }
     }
+
+    /// Test-only escape hatch for the crash-consistency harness
+    /// (`crash_consistency_tests`), which needs to force a specific
+    /// `journal_mode` on a connection to exercise this crate's write
+    /// patterns under both rollback-journal and WAL, independent of
+    /// [`Self::init`]'s own production default.
+    #[cfg(test)]
+    pub(crate) async fn force_pragma_for_test(&self, sql: &str) -> Result<(), SyncEngineError> {
+        let sql = sql.to_string();
+        self.conn
+            .call(move |conn| Ok(conn.execute_batch(&sql)?))
+            .await?;
+        Ok(())
+    }
+
+    /// Test-only: close the underlying connection and wait for it to
+    /// finish, rather than relying on `Drop` to eventually do so on a
+    /// background thread. The crash-consistency harness snapshots this
+    /// database's on-disk files immediately after this returns, so it must
+    /// not race a connection that is still mid-close.
+    #[cfg(test)]
+    pub(crate) async fn close_for_test(self) -> Result<(), SyncEngineError> {
+        self.conn.close().await?;
+        Ok(())
+    }
 }
+
+#[cfg(test)]
+mod crash_consistency_tests;
 
 #[cfg(test)]
 mod tests {

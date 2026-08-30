@@ -191,6 +191,28 @@ pub enum SyncEngineError {
     )]
     IncompatibleSnapshotSchemaVersion { found: u32, expected: u32 },
 
+    /// Returned when a database's actual, in-effect SQLite `journal_mode` or
+    /// `synchronous` setting does not match the configuration
+    /// [`crate::storage::db::SyncEngineDb`]'s crash-safety guarantees
+    /// depend on (see that module's docs). SQLite pragmas can silently fail
+    /// to take effect -- e.g. `journal_mode=WAL` is silently ignored rather
+    /// than erroring on a filesystem/VFS backend without shared-memory
+    /// support -- so this must be verified by reading the setting back
+    /// after every attempt to set it, never assumed from the attempt
+    /// alone. See issue #95.
+    #[error(
+        "unsafe SQLite configuration: journal_mode={journal_mode} (required \
+         {required_journal_mode}), synchronous={synchronous} (required \
+         {required_synchronous}); refusing to open a database whose crash-safety \
+         guarantees cannot be relied on"
+    )]
+    UnsafeSqliteConfiguration {
+        journal_mode: String,
+        required_journal_mode: String,
+        synchronous: i64,
+        required_synchronous: i64,
+    },
+
     #[error("TEE signing is requested but no genuine TEE is available on this device")]
     TeeUnavailable,
 
@@ -238,6 +260,7 @@ impl SyncEngineError {
     /// | `CompressionError` | Permanent | An at-rest compression frame (issue #56 / #93) could not be built or decoded: bad magic, truncated header, invalid DEFLATE stream, or an oversized decompression. The same stored bytes fail identically on every attempt. |
     /// | `ImportTargetNotEmpty` | Permanent | `import_snapshot`'s documented policy refuses a non-empty target. Retrying the identical call against the same database will always hit the same refusal; the caller must choose a fresh database. |
     /// | `IncompatibleSnapshotSchemaVersion` | Permanent | The snapshot was produced by a different schema version than this build expects. Retrying the same import will reproduce the same mismatch; a migration path is needed instead. |
+    /// | `UnsafeSqliteConfiguration` | Permanent | The runtime's actual `journal_mode`/`synchronous` setting does not match what this crate's crash-safety guarantees require. Retrying the same open will reproduce the same mismatch; the environment (filesystem/VFS) must support the required configuration before this crate can safely be used. |
     #[deny(unreachable_patterns)]
     pub fn classify(&self) -> ErrorClass {
         match self {
@@ -266,6 +289,7 @@ impl SyncEngineError {
             SyncEngineError::DecryptionFailed => ErrorClass::Permanent,
             SyncEngineError::ImportTargetNotEmpty => ErrorClass::Permanent,
             SyncEngineError::IncompatibleSnapshotSchemaVersion { .. } => ErrorClass::Permanent,
+            SyncEngineError::UnsafeSqliteConfiguration { .. } => ErrorClass::Permanent,
             SyncEngineError::TeeUnavailable => ErrorClass::Permanent,
             SyncEngineError::TeeSignerUnimplemented => ErrorClass::Permanent,
             SyncEngineError::InvalidAttestation(_) => ErrorClass::Permanent,
@@ -342,6 +366,12 @@ mod tests {
             SyncEngineError::IncompatibleSnapshotSchemaVersion {
                 found: 1,
                 expected: 2,
+            },
+            SyncEngineError::UnsafeSqliteConfiguration {
+                journal_mode: "delete".into(),
+                required_journal_mode: "wal".into(),
+                synchronous: 1,
+                required_synchronous: 2,
             },
             SyncEngineError::TeeUnavailable,
             SyncEngineError::TeeSignerUnimplemented,

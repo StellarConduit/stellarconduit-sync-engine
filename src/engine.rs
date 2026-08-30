@@ -368,6 +368,13 @@ fn open_dispatch_connection(db_path: &str) -> Result<rusqlite::Connection, SyncE
     } else {
         let conn = rusqlite::Connection::open(Path::new(db_path))?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        // Enforce the same crash-safety policy as `SyncEngineDb::init`
+        // (see that module's docs) so this second connection onto the same
+        // file never silently disagrees with the first about what "safe"
+        // means.
+        crate::storage::db::apply_crash_safety_pragmas(&conn)?;
+        let (journal_mode, synchronous) = crate::storage::db::read_crash_safety_pragmas(&conn)?;
+        crate::storage::db::check_crash_safety(&journal_mode, synchronous)?;
         conn
     };
     Ok(conn)

@@ -1,6 +1,8 @@
 pub mod compression_oracle;
 pub mod db;
 pub mod envelope_compression;
+#[cfg(test)]
+mod fault_vfs;
 
 pub use db::{
     ConflictRecord, DbSummary, HistoryEntry, ImportReport, QueuedEnvelopeRecord, SyncEngineDb,
