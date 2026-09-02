@@ -58,8 +58,7 @@
 //!   performs this standard replay-on-startup step (see
 //!   `test_limit_survives_restart` below for the shape of that replay).
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,31 +97,10 @@ impl TryFrom<i64> for TxPriority {
 
 #[derive(Debug, Clone)]
 struct QueuedTx {
-    priority: TxPriority,
     /// Unix seconds when this envelope was pushed. Used as a FIFO tie-break
-    /// within the same priority tier — earlier enqueue wins.
+    /// within the same account queue — earlier enqueue wins.
     enqueued_at: u64,
     envelope: TransactionEnvelope,
-}
-
-impl PartialEq for QueuedTx {
-    fn eq(&self, other: &Self) -> bool {
-        self.envelope.message_id == other.envelope.message_id
-    }
-}
-impl Eq for QueuedTx {}
-
-impl Ord for QueuedTx {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority
-            .cmp(&other.priority)
-            .then_with(|| other.enqueued_at.cmp(&self.enqueued_at))
-    }
-}
-impl PartialOrd for QueuedTx {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
 }
 
 /// Configures the Emergency-tier spending guard on [`OutboundTxQueue`]: at
@@ -187,14 +165,24 @@ impl EmergencyGuard {
     }
 }
 
-/// A local max-heap of outgoing envelopes, ordered by [`TxPriority`] and then
-/// by insertion order (oldest first) within the same tier.
+/// A local queue of outgoing envelopes, ordered by [`TxPriority`].
+///
+/// Within a priority tier, dispatch rotates fairly across source accounts
+/// (round-robin) rather than exhausting one account's entries before moving
+/// to the next. FIFO order is preserved within each account's queue. Higher
+/// tiers always dispatch before lower tiers.
 #[derive(Debug)]
 pub struct OutboundTxQueue {
-    heap: BinaryHeap<QueuedTx>,
+    /// priority tier -> ordered list of (source account, FIFO queue of entries)
+    tiers: BTreeMap<TxPriority, PriorityTier>,
+    /// priority tier -> index of the next account to serve in round-robin
+    cursors: BTreeMap<TxPriority, usize>,
     emergency_guard: Option<EmergencyGuard>,
     clock: Arc<dyn Clock>,
 }
+
+type AccountQueue = VecDeque<QueuedTx>;
+type PriorityTier = Vec<([u8; 32], AccountQueue)>;
 
 impl Default for OutboundTxQueue {
     fn default() -> Self {
@@ -205,7 +193,8 @@ impl Default for OutboundTxQueue {
 impl OutboundTxQueue {
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
-            heap: BinaryHeap::new(),
+            tiers: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             emergency_guard: None,
             clock,
         }
@@ -216,7 +205,8 @@ impl OutboundTxQueue {
     /// are never gated.
     pub fn with_emergency_guard(guard_config: EmergencyGuardConfig, clock: Arc<dyn Clock>) -> Self {
         Self {
-            heap: BinaryHeap::new(),
+            tiers: BTreeMap::new(),
+            cursors: BTreeMap::new(),
             emergency_guard: Some(EmergencyGuard::new(guard_config)),
             clock,
         }
@@ -245,6 +235,28 @@ impl OutboundTxQueue {
     /// `enqueued_at` — if a caller needs to replay previously-accepted
     /// Emergency entries without re-checking the limit (the restart-restore
     /// case), use [`Self::restore_at`] instead.
+    fn insert_tx(&mut self, envelope: TransactionEnvelope, priority: TxPriority, enqueued_at: u64) {
+        let account = envelope.origin_pubkey;
+        let new_tx = QueuedTx {
+            enqueued_at,
+            envelope,
+        };
+        let tier = self.tiers.entry(priority).or_default();
+        if let Some(pos) = tier.iter().position(|(acc, _)| acc == &account) {
+            let queue = &mut tier[pos].1;
+            // Keep each account queue ordered by enqueued_at ascending.
+            let insert_pos = queue
+                .iter()
+                .position(|tx| tx.enqueued_at > enqueued_at)
+                .unwrap_or(queue.len());
+            queue.insert(insert_pos, new_tx);
+        } else {
+            let mut q = VecDeque::new();
+            q.push_back(new_tx);
+            tier.push((account, q));
+        }
+    }
+
     pub fn push_at(
         &mut self,
         envelope: TransactionEnvelope,
@@ -257,11 +269,7 @@ impl OutboundTxQueue {
                 guard.record(enqueued_at);
             }
         }
-        self.heap.push(QueuedTx {
-            priority,
-            enqueued_at,
-            envelope,
-        });
+        self.insert_tx(envelope, priority, enqueued_at);
         Ok(())
     }
 
@@ -282,27 +290,51 @@ impl OutboundTxQueue {
                 guard.record(enqueued_at);
             }
         }
-        self.heap.push(QueuedTx {
-            priority,
-            enqueued_at,
-            envelope,
-        });
+        self.insert_tx(envelope, priority, enqueued_at);
     }
 
     pub fn pop(&mut self) -> Option<TransactionEnvelope> {
-        self.heap.pop().map(|q| q.envelope)
+        // Find the highest priority tier that still has entries.
+        let priority = self.tiers.iter().rev().find_map(|(p, accounts)| {
+            if accounts.iter().any(|(_, q)| !q.is_empty()) {
+                Some(*p)
+            } else {
+                None
+            }
+        })?;
+
+        let accounts = self.tiers.get_mut(&priority).unwrap();
+        let cursor = *self.cursors.get(&priority).unwrap_or(&0);
+        let n = accounts.len();
+
+        // Rotate through accounts until we find a non-empty queue.
+        for offset in 0..n {
+            let idx = (cursor + offset) % n;
+            if !accounts[idx].1.is_empty() {
+                self.cursors.insert(priority, (idx + 1) % n);
+                return accounts[idx].1.pop_front().map(|q| q.envelope);
+            }
+        }
+        None
     }
 
     pub fn peek(&self) -> Option<&TransactionEnvelope> {
-        self.heap.peek().map(|q| &q.envelope)
+        self.tiers.iter().rev().find_map(|(_, accounts)| {
+            accounts
+                .iter()
+                .find_map(|(_, q)| q.front().map(|tx| &tx.envelope))
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.heap.len()
+        self.tiers
+            .values()
+            .map(|accounts| accounts.iter().map(|(_, q)| q.len()).sum::<usize>())
+            .sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.heap.is_empty()
+        self.len() == 0
     }
 }
 
@@ -314,6 +346,17 @@ mod tests {
         TransactionEnvelope {
             message_id: [message_id; 32],
             origin_pubkey: [1u8; 32],
+            tx_xdr: "mock_xdr".to_string(),
+            ttl_hops: 10,
+            timestamp: 1_700_000_000,
+            signature: [0u8; 64],
+        }
+    }
+
+    fn mock_envelope_for_account(message_id: u8, account_id: u8) -> TransactionEnvelope {
+        TransactionEnvelope {
+            message_id: [message_id; 32],
+            origin_pubkey: [account_id; 32],
             tx_xdr: "mock_xdr".to_string(),
             ttl_hops: 10,
             timestamp: 1_700_000_000,
@@ -512,5 +555,80 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn test_round_robin_across_accounts_same_tier() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
+
+        // Account A pushes two Normal entries, then account B pushes two.
+        q.push(mock_envelope_for_account(1, 10), TxPriority::Normal)
+            .unwrap();
+        q.push(mock_envelope_for_account(2, 10), TxPriority::Normal)
+            .unwrap();
+        q.push(mock_envelope_for_account(3, 20), TxPriority::Normal)
+            .unwrap();
+        q.push(mock_envelope_for_account(4, 20), TxPriority::Normal)
+            .unwrap();
+
+        // Round-robin should alternate accounts, preserving FIFO within each.
+        assert_eq!(q.pop().unwrap().message_id, [1u8; 32]); // A first
+        assert_eq!(q.pop().unwrap().message_id, [3u8; 32]); // B first
+        assert_eq!(q.pop().unwrap().message_id, [2u8; 32]); // A second
+        assert_eq!(q.pop().unwrap().message_id, [4u8; 32]); // B second
+        assert!(q.pop().is_none());
+    }
+
+    #[test]
+    fn test_single_account_does_not_starve_others() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
+
+        // Account A hogs the queue with 100 entries.
+        for i in 0..100 {
+            q.push(mock_envelope_for_account(i as u8, 10), TxPriority::Normal)
+                .unwrap();
+        }
+        // Account B only has 2 entries.
+        q.push(mock_envelope_for_account(101, 20), TxPriority::Normal)
+            .unwrap();
+        q.push(mock_envelope_for_account(102, 20), TxPriority::Normal)
+            .unwrap();
+
+        // B's first entry must appear before all of A's are drained.
+        let mut saw_b = false;
+        for _ in 0..102 {
+            let id = q.pop().unwrap().message_id[0];
+            if id == 101 {
+                saw_b = true;
+                break;
+            }
+        }
+        assert!(
+            saw_b,
+            "account B's first entry should not be starved by account A's burst"
+        );
+    }
+
+    #[test]
+    fn test_priority_tier_ordering_unaffected_by_fairness() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut q = OutboundTxQueue::new(clock);
+
+        // Account A has many Normal entries; account B has one Emergency.
+        for i in 0..5 {
+            q.push(mock_envelope_for_account(i as u8, 10), TxPriority::Normal)
+                .unwrap();
+        }
+        q.push(mock_envelope_for_account(200, 20), TxPriority::Emergency)
+            .unwrap();
+
+        // Emergency always jumps ahead of Normal regardless of account.
+        assert_eq!(q.pop().unwrap().message_id, [200u8; 32]);
+        // Then Normal entries proceed (only account A left).
+        for i in 0..5 {
+            assert_eq!(q.pop().unwrap().message_id, [i as u8; 32]);
+        }
+        assert!(q.pop().is_none());
     }
 }
