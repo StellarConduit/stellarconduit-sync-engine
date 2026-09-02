@@ -17,7 +17,9 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # Shared mesh envelope types, signing, and relay-chain proofs
-stellarconduit-core = { git = "https://github.com/StellarConduit/stellarconduit-core.git", rev = "da4c057" }
+# Point to fork that fixes the duplicate reqwest key and broken rpc_client impl
+# until upstream merges the fixes (blocks issue #7).
+stellarconduit-core = { git = "https://github.com/ZacLou/stellarconduit-core.git", rev = "9d64636" }
 
 # Stellar transaction XDR parsing.
 #

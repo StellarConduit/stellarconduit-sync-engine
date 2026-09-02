@@ -59,7 +59,7 @@
 //!   `test_limit_survives_restart` below for the shape of that replay).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
