@@ -7,3 +7,5 @@ docs/issues/
 # fuzz/corpus/ is intentionally still tracked)
 /fuzz/target
 /fuzz/artifacts
+config.bat
+node_modules
