@@ -91,7 +91,11 @@ impl SyncEngine {
         let clock = std::sync::Arc::new(crate::clock::HybridClock::new());
         let mut queue = OutboundTxQueue::new(clock);
         let mut settlement = SettlementTracker::new();
-        for record in db.list_queued_envelopes().await? {
+        // Replay oldest first so any pre-capacity database is trimmed in a
+        // stable order. Missing evictee transitions are persisted as Failed.
+        let mut pending = db.list_queued_envelopes().await?;
+        pending.sort_by_key(|record| (record.enqueued_at, record.envelope.message_id));
+        for record in pending {
             let status = db
                 .get_settlement_status(record.envelope.message_id)
                 .await?
@@ -106,7 +110,20 @@ impl SyncEngine {
             // out of the queue, so it is never dispatched a second time after a
             // restart.
             if status == SettlementStatus::Queued {
-                queue.restore_at(record.envelope, record.priority, record.enqueued_at);
+                if let Some(evicted) =
+                    queue.restore_at(record.envelope, record.priority, record.enqueued_at)
+                {
+                    // Legacy databases can already have more queued items than
+                    // the new cap. Mark each trimmed payment durably before
+                    // exposing a restarted engine, never dropping it silently.
+                    db.set_settlement_status(
+                        evicted.message_id,
+                        SettlementStatus::Failed,
+                        unix_now(),
+                    )
+                    .await?;
+                    settlement.transition(evicted.message_id, SettlementStatus::Failed)?;
+                }
             }
         }
 
@@ -172,6 +189,12 @@ impl SyncEngine {
         self.settlement.status(&message_id)
     }
 
+    /// Local exact metrics for the outbound queue. Off-device export must
+    /// respect the privacy-preserving metrics protocol.
+    pub fn queue_metrics(&self) -> &crate::metrics::SyncEngineMetrics {
+        self.queue.metrics()
+    }
+
     /// Durably record a newly-detected double-spend conflict as unresolved.
     ///
     /// Conflict *detection* (via [`crate::conflict::detect_conflicts`]) and
@@ -200,8 +223,8 @@ impl SyncEngine {
     /// Reserve a sequence number, sign, and durably queue a new payment.
     ///
     /// Crash-safety: see the [module docs](self). In short, the reservation +
-    /// envelope + initial settlement status are written atomically to storage
-    /// before any in-memory state changes, so a crash here is indistinguishable
+    /// envelope + initial settlement status, and any evicted payment's Failed
+    /// status, are written atomically before any in-memory state changes, so a crash here is indistinguishable
     /// from the call never having run.
     pub async fn queue_payment(
         &mut self,
@@ -231,10 +254,25 @@ impl SyncEngine {
         let enqueued_at = unix_now();
         let envelope = hybrid_env.classical_envelope;
 
+        // Capture the oldest member of this tier *before* persistence. Commit
+        // its terminal Failed status in the same SQLite transaction as the
+        // new queued envelope. If the transaction fails, nothing is evicted.
+        let evicted_id = self
+            .queue
+            .eviction_candidate(priority)
+            .map(|e| e.message_id);
+
         // === Durable persistence, atomically, BEFORE any in-memory update. ===
         if let Err(err) = self
             .db
-            .enqueue_transaction(&envelope, source_account, sequence, priority, enqueued_at)
+            .enqueue_transaction_with_eviction(
+                &envelope,
+                source_account,
+                sequence,
+                priority,
+                enqueued_at,
+                evicted_id,
+            )
             .await
         {
             // Roll back the in-memory reservation so a failed (and retried)
@@ -244,9 +282,15 @@ impl SyncEngine {
         }
 
         // === In-memory update, only once durability succeeded. ===
-        self.queue
+        let displaced = self
+            .queue
             .push_at(envelope.clone(), priority, enqueued_at)?;
         self.settlement.track(envelope.message_id);
+        if let Some(victim) = displaced {
+            debug_assert_eq!(Some(victim.message_id), evicted_id);
+            self.settlement
+                .transition(victim.message_id, SettlementStatus::Failed)?;
+        }
 
         Ok(envelope)
     }

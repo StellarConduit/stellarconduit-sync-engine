@@ -551,6 +551,32 @@ impl SyncEngineDb {
         priority: TxPriority,
         enqueued_at: u64,
     ) -> Result<(), SyncEngineError> {
+        self.enqueue_transaction_with_eviction(
+            envelope,
+            source_account,
+            sequence,
+            priority,
+            enqueued_at,
+            None,
+        )
+        .await
+    }
+
+    /// Atomically enqueue a new envelope and transition any capacity-evicted
+    /// queued envelope to Failed, including a settlement history record.
+    /// If the victim is no longer Queued, the entire transaction rolls back.
+    /// This prevents a power loss between insertion and eviction from silently
+    /// dropping a payment or leaving an over-capacity queue after restart.
+    pub async fn enqueue_transaction_with_eviction(
+        &self,
+        envelope: &TransactionEnvelope,
+        source_account: &str,
+        sequence: i64,
+        priority: TxPriority,
+        enqueued_at: u64,
+        evicted_id: Option<[u8; 32]>,
+    ) -> Result<(), SyncEngineError> {
+        let evicted_id = evicted_id.map(|id| id.to_vec());
         let message_id = envelope.message_id.to_vec();
         let envelope_bytes = rmp_serde::to_vec(envelope)?;
 
@@ -587,6 +613,31 @@ impl SyncEngineDb {
                      VALUES (?1, ?2, ?3)",
                     rusqlite::params![message_id, status, enqueued_at as i64],
                 )?;
+                if let Some(victim) = evicted_id {
+                    let updated = tx.execute(
+                        "UPDATE settlement_status SET status = ?1, updated_at = ?2
+                         WHERE message_id = ?3 AND status = ?4",
+                        rusqlite::params![
+                            SettlementStatus::Failed.as_str(),
+                            enqueued_at as i64,
+                            victim,
+                            SettlementStatus::Queued.as_str(),
+                        ],
+                    )?;
+                    if updated != 1 {
+                        return Err(rusqlite::Error::QueryReturnedNoRows.into());
+                    }
+                    tx.execute(
+                        "INSERT INTO settlement_history (message_id, from_status, to_status, timestamp)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            victim,
+                            SettlementStatus::Queued.as_str(),
+                            SettlementStatus::Failed.as_str(),
+                            enqueued_at as i64,
+                        ],
+                    )?;
+                }
                 tx.commit()?;
                 Ok(())
             })
