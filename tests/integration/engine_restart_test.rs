@@ -13,10 +13,11 @@ use tempfile::TempDir;
 
 use stellarconduit_core::message::envelope::validate_envelope;
 
+use stellar_xdr::curr::TransactionResultCode;
 use stellarconduit_sync_engine::engine::SyncEngine;
 use stellarconduit_sync_engine::errors::SyncEngineError;
 use stellarconduit_sync_engine::queue::TxPriority;
-use stellarconduit_sync_engine::settlement::SettlementStatus;
+use stellarconduit_sync_engine::settlement::{SettlementOutcome, SettlementStatus};
 
 /// Real, valid `TransactionEnvelope` XDR, one fixed ed25519 seed byte per
 /// account (`0x44`..`0x99`), generated with the `stellar-xdr` crate — the
@@ -359,4 +360,210 @@ async fn test_mark_settlement_persists_across_restart() {
         matches!(err, SyncEngineError::InvalidStateTransition { .. }),
         "expected InvalidStateTransition proving Settled was rehydrated, got {err:?}"
     );
+}
+
+#[tokio::test]
+async fn test_submission_success_marks_settled_durably() {
+    let (_dir, path) = temp_db_path();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key());
+    let message_id = {
+        let mut engine = SyncEngine::open(&path).await.unwrap();
+        let envelope = engine
+            .queue_payment(
+                fixtures::PERSIST_ACCOUNT,
+                &signer,
+                fixtures::PERSIST_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.next_to_dispatch().unwrap(), envelope);
+        assert_eq!(
+            engine
+                .record_submission_result(
+                    envelope.message_id,
+                    TransactionResultCode::TxSuccess,
+                    200
+                )
+                .await
+                .unwrap(),
+            SettlementOutcome::Settled
+        );
+        assert_eq!(
+            engine.settlement_status(envelope.message_id),
+            Some(SettlementStatus::Settled)
+        );
+        envelope.message_id
+    };
+
+    let mut restored = SyncEngine::open(&path).await.unwrap();
+    assert_eq!(
+        restored.settlement_status(message_id),
+        Some(SettlementStatus::Settled)
+    );
+    assert!(restored.next_to_dispatch().is_none());
+}
+
+#[tokio::test]
+async fn test_submission_bad_auth_marks_failed_durably() {
+    let (_dir, path) = temp_db_path();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key());
+    let message_id = {
+        let mut engine = SyncEngine::open(&path).await.unwrap();
+        let envelope = engine
+            .queue_payment(
+                fixtures::SETTLE_ACCOUNT,
+                &signer,
+                fixtures::SETTLE_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.next_to_dispatch().unwrap(), envelope);
+        assert_eq!(
+            engine
+                .record_submission_result(
+                    envelope.message_id,
+                    TransactionResultCode::TxBadAuth,
+                    200
+                )
+                .await
+                .unwrap(),
+            SettlementOutcome::PermanentFailure
+        );
+        assert_eq!(
+            engine.settlement_status(envelope.message_id),
+            Some(SettlementStatus::Failed)
+        );
+        envelope.message_id
+    };
+
+    let mut restored = SyncEngine::open(&path).await.unwrap();
+    assert_eq!(
+        restored.settlement_status(message_id),
+        Some(SettlementStatus::Failed)
+    );
+    assert!(restored.next_to_dispatch().is_none());
+}
+
+#[tokio::test]
+async fn test_bad_sequence_never_auto_resubmits() {
+    let (_dir, path) = temp_db_path();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key());
+    let message_id = {
+        let mut engine = SyncEngine::open(&path).await.unwrap();
+        let envelope = engine
+            .queue_payment(
+                fixtures::SEQ_ACCOUNT,
+                &signer,
+                fixtures::SEQ_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.next_to_dispatch().unwrap(), envelope);
+        assert_eq!(
+            engine
+                .record_submission_result(envelope.message_id, TransactionResultCode::TxBadSeq, 200)
+                .await
+                .unwrap(),
+            SettlementOutcome::NeedsResequencing
+        );
+        assert_eq!(
+            engine.settlement_status(envelope.message_id),
+            Some(SettlementStatus::Propagating)
+        );
+        assert!(engine.next_to_dispatch().is_none());
+        envelope.message_id
+    };
+
+    let mut restored = SyncEngine::open(&path).await.unwrap();
+    assert_eq!(
+        restored.settlement_status(message_id),
+        Some(SettlementStatus::Propagating)
+    );
+    assert!(
+        restored.next_to_dispatch().is_none(),
+        "a reported bad sequence must not generate a replacement payment"
+    );
+}
+
+#[tokio::test]
+async fn test_transient_result_keeps_payment_pending_across_restart() {
+    let (_dir, path) = temp_db_path();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key());
+    let message_id = {
+        let mut engine = SyncEngine::open(&path).await.unwrap();
+        let envelope = engine
+            .queue_payment(
+                fixtures::DISP_ACCOUNT,
+                &signer,
+                fixtures::DISP_SEQ_1,
+                TxPriority::Normal,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.next_to_dispatch().unwrap(), envelope);
+        assert_eq!(
+            engine
+                .record_submission_result(
+                    envelope.message_id,
+                    TransactionResultCode::TxInternalError,
+                    200
+                )
+                .await
+                .unwrap(),
+            SettlementOutcome::TransientFailure
+        );
+        assert_eq!(
+            engine.settlement_status(envelope.message_id),
+            Some(SettlementStatus::Propagating)
+        );
+        envelope.message_id
+    };
+
+    let mut restored = SyncEngine::open(&path).await.unwrap();
+    assert_eq!(
+        restored.settlement_status(message_id),
+        Some(SettlementStatus::Propagating)
+    );
+    assert!(
+        restored.next_to_dispatch().is_none(),
+        "an unknown result must not trigger an unsafe automatic replay"
+    );
+}
+
+#[tokio::test]
+async fn test_unsubmitted_payment_cannot_be_marked_settled_by_result() {
+    let (_dir, path) = temp_db_path();
+    let signer = stellarconduit_sync_engine::envelope::InMemorySigner::new(signing_key());
+    let mut engine = SyncEngine::open(&path).await.unwrap();
+    let envelope = engine
+        .queue_payment(
+            fixtures::QUEUED_ACCOUNT,
+            &signer,
+            fixtures::QUEUED_SEQ_1,
+            TxPriority::Normal,
+            10,
+        )
+        .await
+        .unwrap();
+
+    let error = engine
+        .record_submission_result(envelope.message_id, TransactionResultCode::TxSuccess, 200)
+        .await
+        .expect_err("cannot apply an on-chain result to an unsubmitted payment");
+    assert!(matches!(
+        error,
+        SyncEngineError::InvalidStateTransition { .. }
+    ));
+    assert_eq!(
+        engine.settlement_status(envelope.message_id),
+        Some(SettlementStatus::Queued)
+    );
+    assert_eq!(engine.next_to_dispatch().unwrap(), envelope);
 }

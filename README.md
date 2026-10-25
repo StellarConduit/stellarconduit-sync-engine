@@ -105,6 +105,12 @@ A state machine tracking each envelope from the moment it's signed offline to fi
 
 **States:** `Queued` → `Propagating` → `Settled` / `Failed` / `Disputed`, with `Failed` able to retry back to `Propagating` and `Disputed` able to resolve to either `Settled` or `Failed` once arbitrated.
 
+**Stellar result classification (issue #16):** `settlement::classify_result` exhaustively maps every `stellar-xdr` 22.1 `TransactionResultCode` to a `SettlementOutcome`:
+
+- `Settled` (`tx_success`, `tx_fee_bump_inner_success`) and `PermanentFailure` (e.g., `tx_bad_auth`, invalid or malformed transactions) map to terminal `SettlementStatus` values.
+- `NeedsResequencing` (`tx_bad_seq`) requires checking the account's on-chain sequence and re-signing a new transaction. `TransientFailure` (time bounds, fees, account balance/state, internal error) requires external reconciliation before any retry. Neither outcome automatically changes the current `Propagating`/`Disputed` status or dispatches another envelope.
+- `SyncEngine::record_submission_result(message_id, code, updated_at)` validates that the envelope was already dispatched or disputed, durably persists definitive status changes with the existing tracker/SQLite transition path, and returns the classification for the embedding wallet/relay to handle. A result code alone must **never** trigger a duplicate payment. `tx_fee_bump_inner_failed` is terminal for the submitted fee-bump transaction; any replacement needs an explicit check of the inner result and on-chain state.
+
 ---
 
 ### `conflict`

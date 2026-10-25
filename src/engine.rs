@@ -45,12 +45,13 @@ use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::envelope::secure_signing::KeySigner;
+use stellar_xdr::curr::TransactionResultCode;
 use stellarconduit_core::message::types::TransactionEnvelope;
 
 use crate::envelope::OfflineEnvelopeBuilder;
 use crate::errors::SyncEngineError;
 use crate::queue::{OutboundTxQueue, SequenceReservationManager, TxPriority};
-use crate::settlement::{SettlementStatus, SettlementTracker};
+use crate::settlement::{classify_result, SettlementOutcome, SettlementStatus, SettlementTracker};
 use crate::storage::SyncEngineDb;
 
 /// Restart-safe driver combining durable storage with the in-memory queue,
@@ -330,6 +331,42 @@ impl SyncEngine {
         // 3. ...advance the in-memory tracker. Validated above, so infallible.
         self.settlement.transition(message_id, next)?;
         Ok(())
+    }
+
+    /// Record a Stellar transaction result without automatically re-sending
+    /// funds. Successful submissions become `Settled` and definitive failures
+    /// become `Failed` using the existing durable transition path. Bad sequence
+    /// and potentially recoverable outcomes leave the current status unchanged
+    /// for explicit on-chain reconciliation by the caller. A replacement
+    /// transaction may require resequencing, a new fee or time bounds, and
+    /// re-signing: a result code alone never authorizes a duplicate payment.
+    ///
+    /// Results are only valid for envelopes already handed to the mesh or
+    /// under dispute; a Queued or terminal envelope is not reclassified.
+    pub async fn record_submission_result(
+        &mut self,
+        message_id: [u8; 32],
+        code: TransactionResultCode,
+        updated_at: u64,
+    ) -> Result<SettlementOutcome, SyncEngineError> {
+        let current = self
+            .settlement_status(message_id)
+            .ok_or_else(|| SyncEngineError::EnvelopeNotFound(hex::encode(message_id)))?;
+        if !matches!(
+            current,
+            SettlementStatus::Propagating | SettlementStatus::Disputed
+        ) {
+            return Err(SyncEngineError::InvalidStateTransition {
+                from: current.as_str().to_string(),
+                to: "submission_result".to_string(),
+            });
+        }
+
+        let outcome = classify_result(code);
+        if let Some(next) = outcome.terminal_status() {
+            self.mark_settlement(message_id, next, updated_at).await?;
+        }
+        Ok(outcome)
     }
 
     /// Synchronous, durable write of the dispatch marker via the engine's
