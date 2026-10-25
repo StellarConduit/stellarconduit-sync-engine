@@ -162,7 +162,7 @@ pub struct MetricsSnapshot {
     /// required escalation to the on-chain dispute resolver (lifetime counter).
     pub disputes_escalated: usize,
     /// Total number of envelopes evicted from the queue due to staleness
-    /// or TTL expiration (lifetime counter).
+    /// or TTL expiration (lifetime counter), including capacity evictions.
     pub queue_evictions: usize,
 }
 
@@ -190,7 +190,7 @@ pub struct SyncEngineMetrics {
     pub failed_total: AtomicUsize,
     pub conflicts_detected: AtomicUsize,
     pub disputes_escalated: AtomicUsize,
-    /// Count of envelopes evicted from queue due to staleness/TTL expiration.
+    /// Count of envelopes evicted from queue due to capacity or staleness/TTL expiration.
     pub queue_evictions: AtomicUsize,
 }
 
@@ -307,7 +307,7 @@ impl SyncEngineMetrics {
         ));
 
         // queue_evictions
-        output.push_str("# HELP stellarconduit_sync_queue_evictions_total Total number of envelopes evicted from queue due to staleness or TTL.\n");
+        output.push_str("# HELP stellarconduit_sync_queue_evictions_total Total number of envelopes evicted from queue due to capacity, staleness or TTL.\n");
         output.push_str("# TYPE stellarconduit_sync_queue_evictions_total counter\n");
         output.push_str(&format!(
             "stellarconduit_sync_queue_evictions_total {}\n",

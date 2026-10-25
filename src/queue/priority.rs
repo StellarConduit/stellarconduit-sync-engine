@@ -60,6 +60,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, VecDeque};
+use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,12 +68,32 @@ use stellarconduit_core::message::types::TransactionEnvelope;
 
 use crate::clock::Clock;
 use crate::errors::SyncEngineError;
+use crate::metrics::SyncEngineMetrics;
+
+/// Memory bounds for the pre-gossip queue, separate from the optional
+/// Emergency admission-rate guard. Emergency has a larger cap than Normal
+/// and Low so urgent offline payments retain greater headroom, but remains
+/// bounded on mobile devices. Only the oldest member of the *incoming tier*
+/// can be displaced; higher-priority payments never evict unrelated tiers.
+pub const EMERGENCY_CAPACITY: usize = 1_024;
+pub const NORMAL_CAPACITY: usize = 512;
+pub const LOW_CAPACITY: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum TxPriority {
     Low = 0,
     Normal = 1,
     Emergency = 2,
+}
+
+impl TxPriority {
+    pub const fn capacity(self) -> usize {
+        match self {
+            Self::Emergency => EMERGENCY_CAPACITY,
+            Self::Normal => NORMAL_CAPACITY,
+            Self::Low => LOW_CAPACITY,
+        }
+    }
 }
 
 impl From<TxPriority> for i64 {
@@ -193,6 +214,8 @@ impl EmergencyGuard {
 pub struct OutboundTxQueue {
     heap: BinaryHeap<QueuedTx>,
     emergency_guard: Option<EmergencyGuard>,
+    /// Local exact counter: a capacity eviction increments it exactly once.
+    metrics: SyncEngineMetrics,
     clock: Arc<dyn Clock>,
 }
 
@@ -207,6 +230,7 @@ impl OutboundTxQueue {
         Self {
             heap: BinaryHeap::new(),
             emergency_guard: None,
+            metrics: SyncEngineMetrics::new(),
             clock,
         }
     }
@@ -218,8 +242,52 @@ impl OutboundTxQueue {
         Self {
             heap: BinaryHeap::new(),
             emergency_guard: Some(EmergencyGuard::new(guard_config)),
+            metrics: SyncEngineMetrics::new(),
             clock,
         }
+    }
+
+    /// Inspect the envelope that would be displaced by a new entry of
+    /// `priority`, without changing queue state. The engine uses this to
+    /// persist the victim's Failed status *atomically* with the new payment.
+    /// Equal timestamps are broken by ascending message ID for determinism.
+    pub fn eviction_candidate(&self, priority: TxPriority) -> Option<&TransactionEnvelope> {
+        let in_tier = self.heap.iter().filter(|q| q.priority == priority);
+        if in_tier.clone().count() < priority.capacity() {
+            return None;
+        }
+        in_tier
+            .min_by_key(|entry| (entry.enqueued_at, entry.envelope.message_id))
+            .map(|entry| &entry.envelope)
+    }
+
+    /// Exact local queue metrics, including the lifetime capacity-eviction
+    /// counter. Off-device export must follow the privacy policy in metrics.rs.
+    pub fn metrics(&self) -> &SyncEngineMetrics {
+        &self.metrics
+    }
+
+    /// Admit an already-authorized entry with an explicit timestamp.
+    /// Return any displaced envelope so the caller can settle it as Failed.
+    fn insert_capped(&mut self, entry: QueuedTx) -> Option<TransactionEnvelope> {
+        let displaced_id = self
+            .eviction_candidate(entry.priority)
+            .map(|envelope| envelope.message_id);
+        let displaced = displaced_id.map(|id| {
+            let mut entries = std::mem::take(&mut self.heap).into_vec();
+            let index = entries
+                .iter()
+                .position(|item| item.envelope.message_id == id && item.priority == entry.priority)
+                .expect("eviction candidate exists in heap");
+            let removed = entries.swap_remove(index);
+            self.heap = BinaryHeap::from(entries);
+            self.metrics
+                .queue_evictions
+                .fetch_add(1, AtomicOrdering::Relaxed);
+            removed.envelope
+        });
+        self.heap.push(entry);
+        displaced
     }
 
     /// Push `envelope` at the given `priority`, timestamped now.
@@ -228,11 +296,13 @@ impl OutboundTxQueue {
     /// is [`TxPriority::Emergency`] and a configured guard's limit has
     /// already been reached — a soft failure the embedding wallet should
     /// use as a signal to demand extra confirmation, not a silent drop.
+    /// A successful push returns the displaced oldest envelope, if any;
+    /// callers must terminally settle it instead of silently forgetting it.
     pub fn push(
         &mut self,
         envelope: TransactionEnvelope,
         priority: TxPriority,
-    ) -> Result<(), SyncEngineError> {
+    ) -> Result<Option<TransactionEnvelope>, SyncEngineError> {
         let enqueued_at = self.clock.now_secs();
         self.push_at(envelope, priority, enqueued_at)
     }
@@ -250,19 +320,18 @@ impl OutboundTxQueue {
         envelope: TransactionEnvelope,
         priority: TxPriority,
         enqueued_at: u64,
-    ) -> Result<(), SyncEngineError> {
+    ) -> Result<Option<TransactionEnvelope>, SyncEngineError> {
         if priority == TxPriority::Emergency {
             if let Some(guard) = &mut self.emergency_guard {
                 guard.check(enqueued_at)?;
                 guard.record(enqueued_at);
             }
         }
-        self.heap.push(QueuedTx {
+        Ok(self.insert_capped(QueuedTx {
             priority,
             enqueued_at,
             envelope,
-        });
-        Ok(())
+        }))
     }
 
     /// Re-admit a previously-accepted envelope (e.g. one reloaded from
@@ -270,23 +339,24 @@ impl OutboundTxQueue {
     /// Emergency guard's limit check. Emergency entries are still folded
     /// into the guard's history so the rolling window correctly accounts
     /// for them — this is what lets the guard survive a forced restart (see
-    /// the module docs). Never rejects.
+    /// the module docs). Never rejects; returns any displaced envelope for
+    /// the restorer to mark Failed in durable settlement storage.
     pub fn restore_at(
         &mut self,
         envelope: TransactionEnvelope,
         priority: TxPriority,
         enqueued_at: u64,
-    ) {
+    ) -> Option<TransactionEnvelope> {
         if priority == TxPriority::Emergency {
             if let Some(guard) = &mut self.emergency_guard {
                 guard.record(enqueued_at);
             }
         }
-        self.heap.push(QueuedTx {
+        self.insert_capped(QueuedTx {
             priority,
             enqueued_at,
             envelope,
-        });
+        })
     }
 
     pub fn pop(&mut self) -> Option<TransactionEnvelope> {
@@ -319,6 +389,158 @@ mod tests {
             timestamp: 1_700_000_000,
             signature: [0u8; 64],
         }
+    }
+
+    /// Numbered unique IDs beyond the 256 values of the small legacy fixture.
+    fn numbered_envelope(index: usize) -> TransactionEnvelope {
+        let mut envelope = mock_envelope((index % 256) as u8);
+        envelope.message_id = [0u8; 32];
+        envelope.message_id[..8].copy_from_slice(&(index as u64).to_be_bytes());
+        envelope
+    }
+
+    #[test]
+    fn test_push_within_capacity_does_not_evict() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in 0..LOW_CAPACITY {
+            assert!(queue
+                .push_at(numbered_envelope(index), TxPriority::Low, index as u64)
+                .unwrap()
+                .is_none());
+        }
+        assert_eq!(queue.len(), LOW_CAPACITY);
+        assert_eq!(queue.metrics().snapshot().queue_evictions, 0);
+    }
+
+    #[test]
+    fn test_push_beyond_capacity_evicts_oldest_in_tier() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in 0..LOW_CAPACITY {
+            queue
+                .push_at(numbered_envelope(index), TxPriority::Low, index as u64)
+                .unwrap();
+        }
+        queue
+            .push_at(numbered_envelope(300), TxPriority::Normal, 0)
+            .unwrap();
+        let evicted = queue
+            .push_at(numbered_envelope(999), TxPriority::Low, 999)
+            .unwrap()
+            .expect("low-tier capacity exceeded");
+        assert_eq!(evicted.message_id, numbered_envelope(0).message_id);
+        assert_eq!(queue.len(), LOW_CAPACITY + 1);
+        assert_eq!(
+            queue.pop().unwrap().message_id,
+            numbered_envelope(300).message_id
+        );
+        assert_eq!(
+            queue.pop().unwrap().message_id,
+            numbered_envelope(1).message_id
+        );
+    }
+
+    #[test]
+    fn test_evicted_envelope_is_returned_to_caller() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in 0..NORMAL_CAPACITY {
+            queue
+                .push_at(numbered_envelope(index), TxPriority::Normal, index as u64)
+                .unwrap();
+        }
+        let victim_id = queue
+            .eviction_candidate(TxPriority::Normal)
+            .expect("normal tier at cap")
+            .message_id;
+        let returned = queue
+            .push_at(numbered_envelope(10_000), TxPriority::Normal, 10_000)
+            .unwrap()
+            .expect("over-capacity push must return displaced envelope");
+        assert_eq!(returned.message_id, victim_id);
+        assert_eq!(queue.len(), NORMAL_CAPACITY);
+    }
+
+    #[test]
+    fn test_eviction_increments_metric() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in 0..LOW_CAPACITY + 2 {
+            queue
+                .push_at(numbered_envelope(index), TxPriority::Low, index as u64)
+                .unwrap();
+        }
+        assert_eq!(queue.metrics().snapshot().queue_evictions, 2);
+        queue.restore_at(numbered_envelope(999), TxPriority::Low, 999);
+        assert_eq!(queue.metrics().snapshot().queue_evictions, 3);
+    }
+
+    #[test]
+    fn test_emergency_tier_capacity_policy() {
+        // The published policy allocates 1024 Emergency, 512 Normal and
+        // 256 Low slots; the runtime test below proves Emergency is capped.
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in 0..EMERGENCY_CAPACITY {
+            assert!(queue
+                .push_at(
+                    numbered_envelope(index),
+                    TxPriority::Emergency,
+                    index as u64
+                )
+                .unwrap()
+                .is_none());
+        }
+        let victim = queue
+            .push_at(numbered_envelope(10_000), TxPriority::Emergency, 10_000)
+            .unwrap()
+            .expect("even emergency tier is bounded");
+        assert_eq!(victim.message_id, numbered_envelope(0).message_id);
+        assert_eq!(queue.len(), EMERGENCY_CAPACITY);
+    }
+
+    #[test]
+    fn test_len_reflects_capacity_after_eviction() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for (priority, count) in [
+            (TxPriority::Emergency, EMERGENCY_CAPACITY),
+            (TxPriority::Normal, NORMAL_CAPACITY),
+            (TxPriority::Low, LOW_CAPACITY),
+        ] {
+            for index in 0..count + 3 {
+                queue
+                    .push_at(
+                        numbered_envelope(50_000 + index + priority as usize * 10_000),
+                        priority,
+                        index as u64,
+                    )
+                    .unwrap();
+                assert!(queue.len() <= EMERGENCY_CAPACITY + NORMAL_CAPACITY + LOW_CAPACITY);
+            }
+        }
+        assert_eq!(
+            queue.len(),
+            EMERGENCY_CAPACITY + NORMAL_CAPACITY + LOW_CAPACITY
+        );
+        assert_eq!(queue.metrics().snapshot().queue_evictions, 9);
+    }
+
+    #[test]
+    fn test_equal_timestamps_use_message_id_as_stable_eviction_tiebreak() {
+        let clock = Arc::new(crate::clock::MockClock::new(100));
+        let mut queue = OutboundTxQueue::new(clock);
+        for index in (1..=LOW_CAPACITY).rev() {
+            queue
+                .push_at(numbered_envelope(index), TxPriority::Low, 123)
+                .unwrap();
+        }
+        let evicted = queue
+            .push_at(numbered_envelope(9999), TxPriority::Low, 123)
+            .unwrap()
+            .unwrap();
+        assert_eq!(evicted.message_id, numbered_envelope(1).message_id);
     }
 
     #[test]

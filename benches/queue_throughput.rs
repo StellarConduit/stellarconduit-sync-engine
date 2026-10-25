@@ -10,14 +10,15 @@
 //! * **256 ("hundreds")** — a moderately busy merchant terminal that has been
 //!   offline for several hours and accumulated a realistic backlog. The heap is
 //!   large enough that `BinaryHeap`'s O(log n) characteristic starts showing.
-//! * **4 096 ("thousands")** — an extreme edge case: a device offline for days
-//!   with many micropayments queued. Any accidental O(n) regression (e.g.
-//!   linear scan instead of heap) would produce a clearly visible 16× slowdown
-//!   relative to the 256-entry case rather than the expected ≈ 1.2× (log₂ 4096
-//!   / log₂ 256 ≈ 1.33).
+//! * **4 096 ("thousands")** — pressure above the three-tier capacity limits;
+//!   this benchmark now captures the steady-state *eviction* cost as well as
+//!   heap operations rather than assuming all 4 096 entries are retained.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use stellarconduit_core::message::types::TransactionEnvelope;
+use stellarconduit_sync_engine::queue::priority::{
+    EMERGENCY_CAPACITY, LOW_CAPACITY, NORMAL_CAPACITY,
+};
 use stellarconduit_sync_engine::queue::{OutboundTxQueue, TxPriority};
 
 fn mock_envelope(id: u32) -> TransactionEnvelope {
@@ -48,8 +49,12 @@ fn bench_push(c: &mut Criterion) {
                     let priority = priorities[(i as usize) % priorities.len()];
                     q.push(mock_envelope(i), priority).unwrap();
                 }
-                // Prevent the compiler from optimizing away the queue.
-                assert_eq!(q.len(), n);
+                // Each priority is selected round-robin and independently
+                // capped. A 4096-input run necessarily exercises evictions.
+                let expected_len = n.div_ceil(3).min(LOW_CAPACITY)
+                    + ((n + 1) / 3).min(NORMAL_CAPACITY)
+                    + (n / 3).min(EMERGENCY_CAPACITY);
+                assert_eq!(q.len(), expected_len);
             });
         });
     }
